@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
+import pickle
 import shutil
 import struct
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -141,6 +144,21 @@ def write_segy_data(template_path: str, output_path: str, data: np.ndarray) -> N
             f.trace[i] = data[i].astype(np.float32)
 
 
+def _read_segy_ns(path: str) -> int:
+    """Read number of time samples from SEG-Y binary header (bytes 3220-3221)."""
+    with open(path, "rb") as f:
+        f.seek(3200)
+        bin_hdr = f.read(400)
+        return struct.unpack(">H", bin_hdr[20:22])[0]
+
+
+def write_segy_data_incremental(output_path: str, trace_indices: np.ndarray, trace_data: np.ndarray) -> None:
+    """Write specific traces to an existing SEG-Y file (r+ mode, no template copy)."""
+    with segyio.open(output_path, "r+", strict=False, ignore_geometry=True) as f:
+        for i in range(len(trace_indices)):
+            f.trace[int(trace_indices[i])] = trace_data[i]
+
+
 def fit_trace(trace: np.ndarray, ns: int) -> np.ndarray:
     trace = np.asarray(trace, dtype=np.float32).reshape(-1)
     if trace.size > ns:
@@ -157,10 +175,130 @@ def add_prediction(pred_sum, pred_count, key, trace) -> None:
     pred_count[key] += 1
 
 
+# ---------------------------------------------------------------------------
+# SEG-Y header reading & geometry-key lookup
+# ---------------------------------------------------------------------------
+
+def i32be(buf: bytes, pos_1b: int) -> int:
+    return struct.unpack(">i", buf[pos_1b - 1 : pos_1b + 3])[0]
+
+
+def bytes_per_sample(fmt: int) -> int:
+    if fmt in (1, 2, 5):
+        return 4
+    if fmt == 3:
+        return 2
+    return 1
+
+
+def scale_coord(v: int, scalar_raw: int) -> int:
+    if scalar_raw == 0:
+        return int(round(v))
+    if scalar_raw > 0:
+        return int(round(float(v) * float(scalar_raw)))
+    return int(round(float(v) / float(-scalar_raw)))
+
+
+def read_segy_headers(path: str, mode: str, profile: SegyProfile) -> List[dict]:
+    """Parse SEG-Y trace headers and extract geometry keys.
+
+    Returns a list of dicts, one per trace:
+      {"trace_idx": int, "key": tuple, "coords": (sx, sy, rx, ry), "ns": int}
+    """
+    byte_pos = profile.byte_pos
+    key_columns = profile.key_columns
+    headers = []
+    with open(path, "rb") as f:
+        f.seek(3200)
+        bin_header = f.read(400)
+        ns_bin = struct.unpack(">H", bin_header[20:22])[0]
+        bps = bytes_per_sample(struct.unpack(">H", bin_header[24:26])[0])
+        f.seek(3600)
+        trace_idx = 0
+        while True:
+            hdr = f.read(240)
+            if len(hdr) < 240:
+                break
+            sx = i32be(hdr, byte_pos["shot_x"])
+            sy = i32be(hdr, byte_pos["shot_y"])
+            rx = i32be(hdr, byte_pos["rec_x"])
+            ry = i32be(hdr, byte_pos["rec_y"])
+            if mode == "fixed":
+                key = tuple(i32be(hdr, byte_pos[k]) for k in key_columns)
+            else:
+                scalar_raw = struct.unpack(">h", hdr[119:121])[0]
+                computed = {
+                    "shot_line": scale_coord(sy, scalar_raw),
+                    "shot_no": scale_coord(sx, scalar_raw),
+                    "shot_stake": scale_coord(sx, scalar_raw),
+                    "recv_line": scale_coord(ry, scalar_raw),
+                    "recv_no": scale_coord(rx, scalar_raw),
+                    "recv_stake": scale_coord(rx, scalar_raw),
+                }
+                key = tuple(
+                    computed[k] if k in computed else i32be(hdr, byte_pos[k])
+                    for k in key_columns
+                )
+            ns_trace = struct.unpack(">H", hdr[114:116])[0] or ns_bin
+            headers.append({
+                "trace_idx": trace_idx,
+                "key": tuple(int(x) for x in key),
+                "coords": (sx, sy, rx, ry),
+                "ns": int(ns_trace),
+            })
+            f.seek(int(ns_trace) * bps, os.SEEK_CUR)
+            trace_idx += 1
+    return headers
+
+
+def build_lookup(headers: List[dict]) -> Dict[Tuple[int, ...], List[int]]:
+    """Build {geometry_key: [trace_idx, ...]} lookup from parsed headers."""
+    lookup: Dict[Tuple[int, ...], List[int]] = defaultdict(list)
+    for h in headers:
+        lookup[h["key"]].append(int(h["trace_idx"]))
+    return dict(lookup)
+
+
+def partial_fill(args, headers, missing_global, pred_sum, pred_count, logger, profile, batch_idx: int) -> None:
+    """Write current pred_sum/pred_count snapshot to output SEGY (intermediate result).
+
+    Uses incremental write: first call copies template, subsequent calls only
+    update traces that have predictions (avoids full-file rewrite).
+    """
+    ns = _read_segy_ns(args.mask_path)
+    lookup = build_lookup(headers)
+    seen_indices = {}
+    for key, total in pred_sum.items():
+        indices = lookup.get(key)
+        if not indices:
+            continue
+        trace = fit_trace(total / max(pred_count[key], 1), ns)
+        for idx in indices:
+            if idx < len(missing_global) and missing_global[idx]:
+                seen_indices[int(idx)] = trace.astype(np.float32)
+
+    if not seen_indices:
+        logger.info("partial_fill: batch=%d nothing to write", batch_idx)
+        return
+
+    output_path = args.output_segy
+    if not Path(output_path).exists():
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(args.mask_path, output_path)
+
+    write_segy_data_incremental(
+        output_path,
+        np.array(list(seen_indices.keys()), dtype=np.intp),
+        np.array(list(seen_indices.values()), dtype=np.float32),
+    )
+    logger.info("partial_fill: batch=%d pred_keys=%d traces_written=%d",
+                batch_idx, len(pred_sum), len(seen_indices))
+
+
 def collate_patches(batch: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
     stacked = {}
     for key in ('data', 'masked_patch', 'trace_mask',
-                'sx_patch', 'sy_patch', 'rx_patch', 'ry_patch', 'trace_indices'):
+                'sx_patch', 'sy_patch', 'rx_patch', 'ry_patch', 'key_values', 'trace_indices'):
         if key in batch[0]:
             stacked[key] = np.stack([b[key] for b in batch])
     stacked['amp_scale'] = np.array([float(b.get('amp_scale', 1.0)) for b in batch], dtype=np.float32)
@@ -384,7 +522,8 @@ def build_dataset(args, logger, profile: SegyProfile):
 
 def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, dataset=None,
                      sampler=None, rank: int = 0, world_size: int = 1,
-                     log_interval: int = 1):
+                     log_interval: int = 1,
+                     headers=None, missing_global=None):
     if dataset is None:
         dataset = build_dataset(args, logger, profile)
 
@@ -399,6 +538,11 @@ def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, d
     )
 
     pred_sum, pred_count = {}, defaultdict(int)
+    # Incremental dicts: only accumulate predictions since the last backfill
+    # This keeps all_gather_object small — just delta, not the entire accumulated dict.
+    pred_sum_inc, pred_count_inc = {}, defaultdict(int)
+    # Rank 0 only: persistent merged state across backfill intervals
+    merged_full_sum = None
     total_missing = 0
     total_traces = 0
     vis_dir = Path(args.output_dir) / "vis"
@@ -426,7 +570,7 @@ def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, d
         trace_mask_all = to_numpy(batch["trace_mask"]).astype(np.float32)
         scale_all = to_numpy(batch["amp_scale"]).astype(np.float32)
         data_all = to_numpy(batch["data"]).astype(np.float32)
-        trace_indices_all = to_numpy(batch["trace_indices"])
+        key_values_all = to_numpy(batch["key_values"]).astype(np.int64)
 
         x_for_model = x_all[:, None, :, :].astype(np.float32)
         coords_for_model = coords_all.astype(np.float32)
@@ -450,8 +594,10 @@ def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, d
 
             for j, is_missing in enumerate(missing):
                 if is_missing:
-                    trace_idx = int(trace_indices_all[s, j])
-                    add_prediction(pred_sum, pred_count, trace_idx, fit_trace(pred[j], ns))
+                    key = tuple(int(v) for v in key_values_all[s, j])
+                    trace = fit_trace(pred[j], ns)
+                    add_prediction(pred_sum, pred_count, key, trace)
+                    add_prediction(pred_sum_inc, pred_count_inc, key, trace)
 
             if args.progress and rank == 0 and s == current_bs - 1:
                 iterator.set_postfix(batch=batch_idx, total_traces=total_traces, total_missing=total_missing)
@@ -467,6 +613,38 @@ def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, d
                 total_missing,
             )
 
+        # Periodic partial backfill: gather only incremental data, rank 0 writes merged result
+        if (args.backfill_interval > 0 and headers is not None
+                and missing_global is not None
+                and (batch_idx + 1) % args.backfill_interval == 0):
+            if world_size > 1:
+                dist.barrier()
+                # all_gather_object only the incremental dicts (small — just delta since last backfill)
+                gathered = [None] * world_size
+                dist.all_gather_object(gathered, (dict(pred_sum_inc), dict(pred_count_inc)))
+                if rank == 0:
+                    if merged_full_sum is None:
+                        merged_full_sum, merged_full_count = {}, defaultdict(int)
+                    for ps, pc in gathered:
+                        for k, v in ps.items():
+                            if k not in merged_full_sum:
+                                merged_full_sum[k] = v.copy()
+                            else:
+                                merged_full_sum[k] += v
+                        for k, v in pc.items():
+                            merged_full_count[k] += v
+                    partial_fill(args, headers, missing_global, merged_full_sum, merged_full_count,
+                                 logger, profile, batch_idx)
+                dist.barrier()
+            else:
+                merged_full_sum = pred_sum
+                merged_full_count = pred_count
+                partial_fill(args, headers, missing_global, merged_full_sum, merged_full_count,
+                             logger, profile, batch_idx)
+            # Clear incremental dicts on all ranks
+            pred_sum_inc.clear()
+            pred_count_inc.clear()
+
     if device.type == "cuda":
         torch.cuda.synchronize()
     seconds = time.perf_counter() - start_time
@@ -479,27 +657,35 @@ def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, d
         len(pred_sum),
     )
     return pred_sum, pred_count, seconds, {
-        "dataset_samples": int(len(dataset)),
+        "dataset_samples": int(global_sample_idx),
         "dataset_traces": int(total_traces),
         "dataset_missing": int(total_missing),
         "prediction_keys": int(len(pred_sum)),
     }
 
 
-def fill_and_verify(args, missing_global, pred_sum, pred_count, logger,
+def fill_and_verify(args, headers, missing_global, pred_sum, pred_count, logger,
                     profile: SegyProfile, label_data=None) -> dict:
     mask_data = read_segy_data(args.mask_path)
     out = mask_data.copy()
     ns = mask_data.shape[1]
-    written, unmatched = set(), []
+    lookup = build_lookup(headers)
+    written = set()
+    unmatched_indices = []  # trace indices where prediction key maps to non-missing trace
+    unmatched_keys = []     # prediction keys that matched no SEGY trace
 
-    for trace_idx, total in pred_sum.items():
-        if not missing_global[trace_idx]:
-            unmatched.append(trace_idx)
+    for key, total in pred_sum.items():
+        indices = lookup.get(key)
+        if not indices:
+            unmatched_keys.append(key)
             continue
-        trace = fit_trace(total / max(pred_count[trace_idx], 1), ns)
-        out[trace_idx] = trace
-        written.add(trace_idx)
+        trace = fit_trace(total / max(pred_count[key], 1), ns)
+        for idx in indices:
+            if not missing_global[idx]:
+                unmatched_indices.append(idx)
+                continue
+            out[idx] = trace
+            written.add(idx)
 
     write_start = time.perf_counter()
     write_segy_data(args.mask_path, args.output_segy, out)
@@ -508,10 +694,12 @@ def fill_and_verify(args, missing_global, pred_sum, pred_count, logger,
     written_sorted = sorted(written)
     missing_indices = set(np.flatnonzero(missing_global).tolist())
     unfilled = sorted(missing_indices - written)
-    after = read_segy_data(args.output_segy)
-    still_missing = np.flatnonzero(missing_global & np.all(np.abs(after) <= args.missing_eps, axis=1)).tolist()
+    # In-memory validation (avoids disk readback)
+    still_missing = np.flatnonzero(
+        missing_global & np.all(np.abs(out) <= args.missing_eps, axis=1)
+    ).tolist()
     observed_changed = np.flatnonzero(
-        (~missing_global) & np.any(np.abs(after - mask_data) > args.missing_eps, axis=1)
+        (~missing_global) & np.any(np.abs(out - mask_data) > args.missing_eps, axis=1)
     ).tolist()
 
     residual_stats = {}
@@ -540,7 +728,8 @@ def fill_and_verify(args, missing_global, pred_sum, pred_count, logger,
         "still_missing_after_write": int(len(still_missing)),
         "observed_changed": int(len(observed_changed)),
         "prediction_keys": int(len(pred_sum)),
-        "unmatched_prediction_keys": int(len(unmatched)),
+        "unmatched_prediction_keys": int(len(unmatched_indices)),
+        "unmatched_geometry_keys": int(len(unmatched_keys)),
         "writeback_seconds": round(writeback_seconds, 3),
         "output_segy": args.output_segy,
         **residual_stats,
@@ -555,7 +744,7 @@ def fill_and_verify(args, missing_global, pred_sum, pred_count, logger,
         logger.info("sorted SEGY written: %s", sorted_path)
 
     save_reports(Path(args.output_dir), written_sorted, unfilled, still_missing,
-                 observed_changed, unmatched, summary)
+                 observed_changed, unmatched_indices, summary)
     logger.info("writeback summary: %s", summary)
     if args.strict_fill and (unfilled or still_missing or observed_changed):
         raise RuntimeError(
@@ -646,9 +835,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ode_rtol", type=float, default=1e-3)
     parser.add_argument("--sde_sampling_method", default="Euler")
     parser.add_argument("--sde_num_steps", type=int, default=250)
+
+    parser.add_argument("--backfill_interval", type=int, default=0,
+                        help="Partial SEGY write every N batches during inference (0 = only at end)")
+    parser.add_argument("--header_mode", choices=["fixed", "self_computed"], default=None,
+                        help="SEG-Y header mode (default from profile)")
+
     args = parser.parse_args()
 
     profile = get_segy_profile(args.segy_profile)
+    if args.header_mode is None:
+        args.header_mode = profile.default_header_mode
     args.output_dir = str(Path(args.output_dir).resolve())
     args.output_segy = args.output_segy or str(Path(args.output_dir) / "filled_missing.sgy")
     args.output_residual_segy = args.output_residual_segy or str(Path(args.output_dir) / "residual.sgy")
@@ -690,6 +887,13 @@ def main() -> None:
             mask_data.shape[1],
             int(missing_global.sum()),
         )
+
+    # Read SEG-Y trace headers for geometry-key-based matching
+    headers = read_segy_headers(args.mask_path, args.header_mode, profile)
+    if rank == 0:
+        n_keys = len({tuple(h["key"]) for h in headers})
+        logger.info("SEG-Y headers parsed: traces=%d unique_geometry_keys=%d mode=%s",
+                     len(headers), n_keys, args.header_mode)
 
     label_data = None
     if args.label_segy:
@@ -740,7 +944,7 @@ def main() -> None:
         # Inference-only DDP: each rank processes its own data subset independently.
         # No gradient sync needed — the model runs raw.  Only dist.all_gather_object
         # below is used to merge predictions across ranks.
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
         if rank == 0:
             logger.info("DDP: world_size=%d rank=%d local_rank=%d", world_size, rank, local_rank)
     else:
@@ -751,33 +955,87 @@ def main() -> None:
         args, fpm, device, logger, ns=mask_data.shape[1], profile=profile, dataset=dataset,
         sampler=sampler, rank=rank, world_size=world_size,
         log_interval=log_interval,
+        headers=headers, missing_global=missing_global,
     )
 
-    # Gather predictions across all ranks
+    # ---- File-based DDP merge (avoids NCCL all_gather_object timeout) ----
     if world_size > 1:
-        dist.barrier()
-        gathered = [None] * world_size
-        dist.all_gather_object(gathered, (pred_sum, dict(pred_count), infer_stats))
+        dist.barrier()  # lightweight sync — all ranks finished inference
+        _RANK_TMP = Path(tempfile.gettempdir()) / (
+            "infer_merge_" + hashlib.md5(args.output_dir.encode()).hexdigest()[:12]
+        )
+        _rank_dir = _RANK_TMP / f"rank_{rank}"
+        _rank_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save pred_sum: keys via pickle, arrays via npz
+        _r_keys = list(pred_sum.keys())
+        with open(_rank_dir / "pred_keys.pkl", "wb") as _f:
+            pickle.dump(_r_keys, _f, protocol=pickle.HIGHEST_PROTOCOL)
+        _npz_dict = {f"arr_{i}": pred_sum[k] for i, k in enumerate(_r_keys)}
+        np.savez(_rank_dir / "pred_sum.npz", **_npz_dict)
+
+        # Save pred_count: stringify tuple keys with "__" separator
+        with open(_rank_dir / "pred_count.json", "w") as _f:
+            json.dump({"__".join(map(str, k)): int(v) for k, v in pred_count.items()}, _f)
+
+        # Save infer_stats
+        with open(_rank_dir / "infer_stats.json", "w") as _f:
+            json.dump(infer_stats, _f)
+
+        # File-based barrier: signal completion
+        (_RANK_TMP / f".rank_{rank}_done").touch()
+
         if rank == 0:
+            _max_wait = 86400  # 24h
+            logger.info("file barrier: waiting for %d ranks (tmp=%s)...", world_size, _RANK_TMP)
+            _waited = 0
+            _pending = set(range(world_size))
+            while _pending:
+                time.sleep(2)
+                _waited += 2
+                _pending = {r for r in _pending
+                            if not (_RANK_TMP / f".rank_{r}_done").exists()}
+                if _waited % 60 == 0:
+                    logger.info("still waiting for ranks %s (%ds)...", sorted(_pending), _waited)
+                if _waited > _max_wait:
+                    raise RuntimeError(
+                        f"File barrier timed out after {_max_wait}s. "
+                        f"Missing ranks: {sorted(_pending)}."
+                    )
+
+            logger.info("all ranks done, merging %d result files...", world_size)
             merged_sum, merged_count = {}, defaultdict(int)
-            merged_stats = {"dataset_samples": 0, "dataset_traces": 0, "dataset_missing": 0, "prediction_keys": 0}
-            for ps, pc, st in gathered:
-                for k, v in ps.items():
-                    if k not in merged_sum:
-                        merged_sum[k] = v.copy()
-                    else:
-                        merged_sum[k] += v
-                for k, v in pc.items():
-                    merged_count[k] += v
-                for sk in merged_stats:
-                    merged_stats[sk] += st.get(sk, 0)
+            merged_stats = {"dataset_samples": 0, "dataset_traces": 0,
+                            "dataset_missing": 0, "prediction_keys": 0}
+            for r in range(world_size):
+                _rd = _RANK_TMP / f"rank_{r}"
+                with open(_rd / "pred_keys.pkl", "rb") as _f:
+                    _r_keys = pickle.load(_f)
+                with np.load(_rd / "pred_sum.npz") as _rd_npz:
+                    for i, k in enumerate(_r_keys):
+                        arr = _rd_npz[f"arr_{i}"]
+                        if k in merged_sum:
+                            merged_sum[k] += arr
+                        else:
+                            merged_sum[k] = arr.copy()
+                with open(_rd / "pred_count.json") as _f:
+                    for k_str, v in json.load(_f).items():
+                        merged_count[tuple(int(x) for x in k_str.split("__"))] += v
+                with open(_rd / "infer_stats.json") as _f:
+                    for sk, sv in json.load(_f).items():
+                        merged_stats[sk] = merged_stats.get(sk, 0) + sv
+
             pred_sum, pred_count = merged_sum, merged_count
+            merged_stats["prediction_keys"] = len(merged_sum)
             infer_stats = merged_stats
+            # Cleanup temp files (rank 0 only, after merge completes)
+            shutil.rmtree(_RANK_TMP, ignore_errors=True)
+            logger.info("merge complete: %d unique keys", len(pred_sum))
         dist.barrier()
     
     if rank == 0:
         print('begin fill segy ')
-        summary = fill_and_verify(args, missing_global, pred_sum, pred_count,
+        summary = fill_and_verify(args, headers, missing_global, pred_sum, pred_count,
                                   logger, profile=profile, label_data=label_data)
         summary.update({k: v for k, v in infer_stats.items() if k in ("dataset_traces", "dataset_missing", "prediction_keys")})
         summary["inference_seconds"] = round(inference_seconds, 3)

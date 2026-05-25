@@ -15,15 +15,15 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"  # >1 enables DDP via torchrun
 DEVICE="${DEVICE:-cuda:0}"  # only used in single-GPU mode
 
-CHECKPOINT="${CHECKPOINT:-/home/2dongfang_0511_flow/resultsFPM/trace_axis_datatype_sw06_0517/checkpoints/model-epoch-140.pth}"
-H5_REGULAR="${H5_REGULAR:-/cloud/cloud-s3fs/dongfang_syn_reg/h5/sw06_label.h5}"
-H5_MASK="${H5_MASK:-/cloud/cloud-s3fs/dongfang_syn_reg/h5/sw06_mask.h5}"
-MASK_SEGY="${MASK_SEGY:-/cloud/cloud-s3fs/dongfang_syn_reg/mask_miss30pct_004-sw06-Sj5-label.sgy}"
+CHECKPOINT="${CHECKPOINT:-${ROOT_DIR}/resultsFPM/trace_axis_datatype_sw06_0517/checkpoints/model-epoch-140.pth}"
+H5_REGULAR="${H5_REGULAR:-/data/shared/dongfang_syn_reg/h5_sw06/sw06_label.h5}"
+H5_MASK="${H5_MASK:-/data/shared/dongfang_syn_reg/h5_sw06/sw06_mask.h5}"
+MASK_SEGY="${MASK_SEGY:-/data/shared/dongfang_syn_reg/mask_miss30pct_004-sw06-Sj5-label.sgy}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/gen_fill_results_sw}"
 OUTPUT_SEGY="${OUTPUT_SEGY:-${OUTPUT_DIR}/filled_missing.sgy}"
 OUTPUT_RESIDUAL_SEGY="${OUTPUT_RESIDUAL_SEGY:-${OUTPUT_DIR}/residual.sgy}"
-LABEL_SEGY="${LABEL_SEGY:-/cloud/cloud-s3fs/dongfang_syn_reg/004-sw06-Sj5-label.sgy}"  # ground truth SEGY for residual computation (optional)
+LABEL_SEGY="${LABEL_SEGY:-/data/shared/dongfang_syn_reg/004-sw06-Sj5-label.sgy}"  # ground truth SEGY for residual computation (optional)
 
 SEGY_PROFILE="${SEGY_PROFILE:-sw06}"
 
@@ -59,6 +59,10 @@ VIS_BATCHES="${VIS_BATCHES:-0}"
 # Output SEGY sorting
 SORT_OUTPUT="${SORT_OUTPUT:-true}"  # sort output traces by profile.sort_keys
 
+# Periodic backfill and header mode
+BACKFILL_INTERVAL="${BACKFILL_INTERVAL:-0}"  # partial SEGY write every N batches (0 = only at end)
+HEADER_MODE="${HEADER_MODE:-}"  # fixed | self_computed (default from profile)
+
 mkdir -p "${OUTPUT_DIR}"
 
 cmd=(
@@ -92,6 +96,8 @@ cmd=(
   --trace_ps "${TRACE_PS}"
   --overlap_ratio "${OVERLAP_RATIO}"
   --sort_output "${SORT_OUTPUT}"
+  --backfill_interval "${BACKFILL_INTERVAL}"
+  --header_mode "${HEADER_MODE}"
 )
 
 if [[ -n "${TIME_PS}" ]]; then
@@ -136,6 +142,8 @@ echo "geom_mode     : ${GEOM_MODE}"
 echo "use_p_scale   : ${USE_P_SCALE}"
 echo "visualize     : ${VISUALIZE}"
 echo "sort_output   : ${SORT_OUTPUT}"
+echo "backfill_interval: ${BACKFILL_INTERVAL}"
+echo "header_mode   : ${HEADER_MODE:-<default>}"
 echo "============================================================"
 
 "${LAUNCHER[@]}" "${ROOT_DIR}/gen_infer.py" "${cmd[@]}" 2>&1 | tee "${OUTPUT_DIR}/run_gen_infer.stdout.log"
