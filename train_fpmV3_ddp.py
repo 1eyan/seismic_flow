@@ -242,7 +242,10 @@ def config():
         default=-1,
         help="Local rank. Required for multi-GPU training.",
     )
-    return parser.parse_args()
+    # dataset/config.py parses data-specific flags such as --h5File via
+    # parse_known_args(); keep the training parser permissive so those flags can
+    # be passed in the same launch command.
+    return parser.parse_known_args()[0]
 
 
 class trainer:

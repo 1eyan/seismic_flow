@@ -190,6 +190,16 @@ class DatasetH5_interp(torch.utils.data.Dataset):
             return np.asarray(h5[fallback], dtype=np.int64)
         return np.full(len(h5["data"]), int(default), dtype=np.int64)
 
+    def _key_values_for_selected(self, selected: np.ndarray) -> Optional[np.ndarray]:
+        """Return per-trace geometry keys used by gen_infer.py for SEG-Y fill-back."""
+        if self.profile is None:
+            return None
+        cols = []
+        for key in self.profile.key_columns:
+            fallback = self.profile.h5_fallback.get(key)
+            cols.append(self._h5_int_array(self.h5_data, key, fallback=fallback)[selected])
+        return np.stack(cols, axis=1).astype(np.int64)
+
     
     def typical_grid_step(self, arr, eps=1e-9):
         u = np.sort(np.unique(arr))
@@ -338,7 +348,8 @@ class DatasetH5_interp(torch.utils.data.Dataset):
 
         time_axis_2d = self._time_axis_2d(len(selected))
 
-        return {
+        key_values = self._key_values_for_selected(selected)
+        sample = {
             'data': data_patch.astype(np.float32),       # 原始数据（target）
             'masked_patch': masked_patch.astype(np.float32),  # masked 输入
             'mask': mask.astype(np.float32),              # 缺失 mask
@@ -353,6 +364,9 @@ class DatasetH5_interp(torch.utils.data.Dataset):
                               else selected).astype(np.int64),
             **amplitude_metadata(thres, self.patch_amp_percentile),
         }
+        if key_values is not None:
+            sample['key_values'] = key_values
+        return sample
 
     def _get_test_item(self, idx: int) -> Dict[str, Any]:
         n_total = len(self.h5_data['data'])
@@ -388,7 +402,8 @@ class DatasetH5_interp(torch.utils.data.Dataset):
             self.h5_data['ry'][selected],
         )
 
-        return {
+        key_values = self._key_values_for_selected(selected)
+        sample = {
             'data': data_patch.astype(np.float32),
             'masked_patch': masked_patch.astype(np.float32),
             'trace_mask': trace_mask,
@@ -401,6 +416,9 @@ class DatasetH5_interp(torch.utils.data.Dataset):
             'trace_indices': (self.sort_order[selected] if self.sort_order is not None
                               else selected).astype(np.int64),
         }
+        if key_values is not None:
+            sample['key_values'] = key_values
+        return sample
 
 
 class DatasetH5_interp_v2(DatasetH5_interp):
@@ -543,7 +561,8 @@ class DatasetH5_interp_v2(DatasetH5_interp):
         sx_n, sy_n, rx_n, ry_n = self._normalize_coords(sx_full, sy_full, rx_full, ry_full)
         time_axis_2d = self._time_axis_2d(len(selected))
 
-        return {
+        key_values = self._key_values_for_selected(selected)
+        sample = {
             "data": data_patch.astype(np.float32),
             "masked_patch": masked_patch.astype(np.float32),
             "mask": mask.astype(np.float32),
@@ -557,6 +576,9 @@ class DatasetH5_interp_v2(DatasetH5_interp):
             "trace_indices": selected.astype(np.int64),
             **amplitude_metadata(thres, self.global_amp_percentile),
         }
+        if key_values is not None:
+            sample["key_values"] = key_values
+        return sample
 
     
 

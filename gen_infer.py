@@ -144,6 +144,20 @@ def write_segy_data(template_path: str, output_path: str, data: np.ndarray) -> N
             f.trace[i] = data[i].astype(np.float32)
 
 
+def write_sorted_segy(template_path: str, output_path: str, order: np.ndarray, data: np.ndarray) -> None:
+    """Write a SEG-Y file with trace headers and trace samples sorted together."""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(template_path, output_path)
+    with segyio.open(template_path, "r", strict=False, ignore_geometry=True) as src, \
+            segyio.open(output_path, "r+", strict=False, ignore_geometry=True) as dst:
+        if src.tracecount != data.shape[0]:
+            raise ValueError(f"SEGY tracecount={src.tracecount}, data traces={data.shape[0]}")
+        for new_idx, old_idx in enumerate(order):
+            old_idx = int(old_idx)
+            dst.header[new_idx] = src.header[old_idx]
+            dst.trace[new_idx] = data[old_idx].astype(np.float32)
+
+
 def _read_segy_ns(path: str) -> int:
     """Read number of time samples from SEG-Y binary header (bytes 3220-3221)."""
     with open(path, "rb") as f:
@@ -735,11 +749,14 @@ def fill_and_verify(args, headers, missing_global, pred_sum, pred_count, logger,
         **residual_stats,
     }
     if args.sort_output:
-        sorted_path = str(Path(args.output_segy).with_suffix('_sorted.sgy'))
-        sort_keys = _read_segy_sort_keys(args.output_segy, profile)
-        order = np.argsort(sort_keys)
-        sorted_data = out[order]
-        write_segy_data(args.output_segy, sorted_path, sorted_data)
+        out_path = Path(args.output_segy)
+        sorted_path = str(out_path.with_name(f"{out_path.stem}_sorted{out_path.suffix}"))
+        sort_keys = np.asarray(_read_segy_sort_keys(args.output_segy, profile), dtype=np.int64)
+        if sort_keys.ndim == 1:
+            order = np.argsort(sort_keys)
+        else:
+            order = np.lexsort(sort_keys.T[::-1])
+        write_sorted_segy(args.output_segy, sorted_path, order, out)
         summary["output_segy_sorted"] = sorted_path
         logger.info("sorted SEGY written: %s", sorted_path)
 
