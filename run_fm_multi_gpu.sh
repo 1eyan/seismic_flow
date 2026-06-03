@@ -39,6 +39,8 @@ SAMPLING_METHOD="${SAMPLING_METHOD:-ode}"  # ode | sde
 ODE_NUM_STEPS="${ODE_NUM_STEPS:-50}"
 SDE_NUM_STEPS="${SDE_NUM_STEPS:-250}"
 RESUME="${RESUME:-}"  # set to checkpoint path to resume
+PRETRAINED="${PRETRAINED:-}"  # set to pretrained checkpoint path for weight initialization
+PRETRAINED_STRICT="${PRETRAINED_STRICT:-true}"
 echo "======================================"
 echo "开始使用 Accelerate 进行分布式训练"
 echo "GPU: $CUDA_VISIBLE_DEVICES"
@@ -50,6 +52,8 @@ echo "Data Type: $DATA_TYPE"
 echo "segy_profile: $SEGY_PROFILE"
 echo "geom_mode: $GEOM_MODE"
 echo "use_p_scale: $USE_P_SCALE"
+echo "pretrained: ${PRETRAINED:-none}"
+echo "pretrained_strict: $PRETRAINED_STRICT"
 echo "======================================"
 
 # 方法1: 使用配置文件（推荐，端口自动选择）
@@ -73,7 +77,8 @@ accelerate launch --config_file accelerate_config.yaml --main_process_port 29501
     --sampling_method $SAMPLING_METHOD \
     --ode_num_steps $ODE_NUM_STEPS \
     --sde_num_steps $SDE_NUM_STEPS \
-    $([ -n "${RESUME}" ] && echo "--resume ${RESUME}")
+    $([ -n "${RESUME}" ] && echo "--resume ${RESUME}") \
+    $([ -n "${PRETRAINED}" ] && echo "--pretrained ${PRETRAINED} --pretrained_strict ${PRETRAINED_STRICT}")
 
 # 方法2: 直接指定参数（无需配置文件，自动选择端口）
 # accelerate launch --num_processes=2 --num_machines=1 --mixed_precision=no --main_process_port=0 train_ddpmV3_ddp.py \

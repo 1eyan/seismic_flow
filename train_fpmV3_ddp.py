@@ -227,6 +227,21 @@ def config():
         default=None,
         help="Resume training from a checkpoint path, e.g. --resume ./resultsFPM/.../checkpoints/model-5.pth",
     )
+    # pretrained model initialization
+    parser.add_argument(
+        "--pretrained",
+        type=str,
+        default=None,
+        help="Path to pretrained model weights for initialization (does NOT resume optimizer/scheduler), "
+             "e.g. --pretrained ./resultsFPM/.../checkpoints/model-10.pth",
+    )
+    parser.add_argument(
+        "--pretrained_strict",
+        type=str2bool,
+        default=True,
+        help="Whether to strictly enforce matching keys when loading pretrained weights (default: True). "
+             "Set to False to allow partial loading (e.g. when model head dimensions differ).",
+    )
     # segy profile
     parser.add_argument(
         "--segy_profile",
@@ -860,6 +875,30 @@ def main():
         )
 
     print("time_steps:", args.time_steps)
+
+    # ---- Pretrained model initialization ----
+    if args.pretrained is not None:
+        if not os.path.isfile(args.pretrained):
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {args.pretrained}")
+        if rank == 0:
+            print(f"Loading pretrained weights from: {args.pretrained} (strict={args.pretrained_strict})")
+        ckp = torch.load(args.pretrained, map_location="cpu")
+        state_dict = ckp.get("model", ckp)  # support both full checkpoint and raw state_dict
+        # strip DDP wrapper prefix if present
+        stripped = {}
+        for k, v in state_dict.items():
+            key = k
+            if key.startswith("module."):
+                key = key[7:]
+            stripped[key] = v
+        missing, unexpected = model_unet.load_state_dict(stripped, strict=args.pretrained_strict)
+        if rank == 0:
+            if missing:
+                print(f"Missing keys ({len(missing)}): {missing}")
+            if unexpected:
+                print(f"Unexpected keys ({len(unexpected)}): {unexpected}")
+        print(f"Pretrained weights loaded successfully from: {args.pretrained}")
+    # ----------------------------------------------------------------
 
     res_dir = f"./resultsFPM/{args.model_name}_datatype_{args.data_type}_0517"
 
