@@ -1,8 +1,8 @@
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--h5File', type=str, default='/cloud/cloud-s3fs/dongfang_syn_reg/h5/sw06_irregular.h5')
-parser.add_argument('--h5File_regular', type=str, default='/cloud/cloud-s3fs/dongfang_syn_reg/h5/sw06_label.h5')
+parser.add_argument('--h5File', type=str, default='/data/shared/测试数据/h5/field1031_irregular.h5')
+parser.add_argument('--h5File_regular', type=str, default='/data/shared/测试数据/h5/field1031_label.h5')
 parser.add_argument('--train_idx_np', type=str, default='/home/chengzhitong/5d_regular/seis_flow_data12V2/generate_py/h5/segc3/segc3_1_info/kept_trace_indices_random_0.5.npy')
 '''parser.add_argument('--h5File_2', type=str, default='/home/chengzhitong/5d_regular/seis_flow_data12V2/generate_py/h5/segc3/segc3_2.h5')
 parser.add_argument('--h5File_regular_2', type=str, default='/home/chengzhitong/5d_regular/seis_flow_data12V2/generate_py/h5/segc3/segc3_2.h5')
@@ -13,9 +13,9 @@ parser.add_argument('--train_idx_np_3', type=str, default='/home/chengzhitong/5d
 parser.add_argument('--h5File_4', type=str, default='/home/chengzhitong/5d_regular/seis_flow_data12V2/generate_py/h5/segc3/segc3_4.h5')
 parser.add_argument('--h5File_regular_4', type=str, default='/home/chengzhitong/5d_regular/seis_flow_data12V2/generate_py/h5/segc3/segc3_4.h5')
 parser.add_argument('--train_idx_np_4', type=str, default='/home/chengzhitong/5d_regular/seis_flow_data12V2/generate_py/h5/segc3/segc3_4_info/kept_trace_indices_random_0.5.npy')'''
-parser.add_argument('--time_ps', type=int, default=2048)
+parser.add_argument('--time_ps', type=int, default=1256)
 parser.add_argument('--trace_ps', type=int, default=128)
-parser.add_argument('--sample_num', type=int, default=2048)
+parser.add_argument('--sample_num', type=int, default=1256)
 parser.add_argument('--train', type=bool, default=True)
 parser.add_argument('--expand', type=float, default=0.1)
 parser.add_argument('--min_r', type=float, default=0.4)

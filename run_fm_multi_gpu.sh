@@ -20,13 +20,13 @@
 
 
 MODEL_NAME="trace_axis"
-BATCH_SIZE=1
+BATCH_SIZE=8
 LR=1e-4
 EPOCHS=200
 MODEL_TYPE="trace_axis"  # trace_axis | gated | tp
 SEED=515
-DATA_TYPE="sw06"
-SEGY_PROFILE="${SEGY_PROFILE:-sw06}"  # sw06 | field1031 | segc3
+DATA_TYPE="field1031"
+SEGY_PROFILE="${SEGY_PROFILE:-field1031}"  # sw06 | field1031 | segc3
 USE_P_SCALE="${USE_P_SCALE:-true}"
 USE_MISSING_EMBEDDING="${USE_MISSING_EMBEDDING:-false}"
 USE_ENERGY_MLP="${USE_ENERGY_MLP:-false}"

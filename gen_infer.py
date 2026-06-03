@@ -373,8 +373,8 @@ def visualize_batch(
         axes[0],
         [masked_patch, pred, data, residual],
         ["Masked Input", "FPM Prediction", "Ground Truth", "Residual (Pred - GT)"],
-        [-vmax, -vmax, -vmax, -res_abs_max],
-        [vmax, vmax, vmax, res_abs_max],
+        [-vmax, -vmax, -vmax, -vmax],
+        [vmax, vmax, vmax, vmax],
     ):
         ax.imshow(img.T, aspect="auto", cmap="seismic", vmin=vmn, vmax=vmx, origin="upper")
         ax.set_title(title)
