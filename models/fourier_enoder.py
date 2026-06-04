@@ -137,16 +137,26 @@ def fourier_feature_mapping(x: torch.Tensor,
 
 class Seismic5DEncoder(nn.Module):
     """
-    - 输入 coords: shape (B, D) 或 (B, N, D)  (D=5 通常)
-    - 可选地对 token 维度做聚合
-    - 输出 shape: (B, out_dim) or (B, N, out_dim) 取决于 aggregate 参数
+    Multi-resolution coordinate encoder for 5D (or arbitrary-D) seismic coordinates.
+
+    Supports three positional encoding strategies:
+      - 'transformer': per-dimension sinusoidal PE  (sin/cos at fixed log-spaced wavelengths)
+      - 'log_spaced':  NeRF-style log-spaced Fourier feature mapping
+      - 'gaussian':    Gaussian Random Fourier Features
+
+    Input:
+      coords: (B, D) or (B, N, D)
+    Output (depending on aggregate):
+      "none":  (B, out_dim) for 2D, or (B, N, out_dim) for 3D  — note 2D returns (B, 1, out_dim)
+      "mean":  (B, out_dim) — mean over token dim
+      "max":   (B, out_dim) — max over token dim
     """
 
     def __init__(
         self,
-        coord_dim: int = 9,
+        coord_dim: int = 5,
         num_bands: int = 8,
-        num_bans_gauss:int =128,
+        num_bands_gauss: int = 128,
         max_freq: float = 64.0,
         include_input: bool = True,
         mlp_hidden: Optional[list] = None,
@@ -154,9 +164,8 @@ class Seismic5DEncoder(nn.Module):
         dropout: float = 0.0,
         activation: nn.Module = nn.SiLU(),
         norm: Optional[str] = "layernorm",
-        learnable_freq: bool = False,
         base: float = 2.0,
-        pe_type ='transformer',
+        pe_type: str = "transformer",
     ):
         super().__init__()
         if mlp_hidden is None:
@@ -166,30 +175,41 @@ class Seismic5DEncoder(nn.Module):
         self.num_bands = num_bands
         self.max_freq = max_freq
         self.include_input = include_input
-        self.learnable_freq = learnable_freq
         self.base = base
+        self.pe_type = pe_type
 
-        # 计算 ffm 后的维度
+        # Fourier feature output dim (log_spaced)
         ffm_dim = coord_dim * (2 * num_bands)
         if include_input:
             ffm_dim += coord_dim
-            
-        ##选择pe
-        self.pe_type = pe_type
-        self.pe = PositionalEncoding(out_dim,)
-        self.guassian_pe = GaussianRFF(coord_dim,num_bands=num_bans_gauss,sigma=0.1,include_input=include_input, out_dim=out_dim)
 
-        # MLP
-        layers = []
-        if pe_type == 'transformer':
-            in_dim = coord_dim*out_dim
-        elif pe_type == 'log_spaced':
+        # Gaussian RFF output dim
+        gauss_pe_dim = 2 * num_bands_gauss
+        if include_input:
+            gauss_pe_dim += coord_dim
+
+        # PE modules
+        if pe_type == "transformer":
+            self.pe = PositionalEncoding(out_dim)
+        elif pe_type == "gaussian":
+            self.gaussian_pe = GaussianRFF(
+                coord_dim, num_bands=num_bands_gauss, sigma=10,
+                include_input=include_input, out_dim=out_dim,
+            )
+
+        # MLP input dimension
+        if pe_type == "transformer":
+            in_dim = coord_dim * out_dim
+        elif pe_type == "log_spaced":
             in_dim = ffm_dim
-        elif pe_type == 'gaussian':
-            in_dim = coord_dim+2*num_bans_gauss
-            #print('in_dim',in_dim)
+        elif pe_type == "gaussian":
+            in_dim = gauss_pe_dim
         else:
-            raise ValueError("pe_type must be one of 'transformer', 'log_spaced', 'gaussian'")
+            raise ValueError(
+                "pe_type must be one of 'transformer', 'log_spaced', 'gaussian'"
+            )
+
+        layers = []
         for h in mlp_hidden:
             layers.append(nn.Linear(in_dim, h))
             if norm == "layernorm":
@@ -201,77 +221,72 @@ class Seismic5DEncoder(nn.Module):
                 layers.append(nn.Dropout(dropout))
             in_dim = h
         layers.append(nn.Linear(in_dim, out_dim))
-        # 最后一层不接激活（作为 embedding）
         self.mlp = nn.Sequential(*layers)
 
     def forward(
         self, coords: torch.Tensor, aggregate: Literal["mean", "max", "none"] = "none"
     ) -> torch.Tensor:
         """
-        coords: (B, D) 或 (B, N, D)
+        coords: (B, D) or (B, N, D)
         aggregate:
-            - 'mean': 先对 token 维 (N) 做 mean -> 返回 (B, out_dim)
-            - 'max':  对 N 做 max -> 返回 (B, out_dim)
-            - 'none': 返回每个位置的 embedding (B, N, out_dim)
+            - 'none': (B, 1, out_dim) for 2D; (B, N, out_dim) for 3D
+            - 'mean': (B, out_dim) — mean over token dim
+            - 'max':  (B, out_dim) — max over token dim
         """
         if coords.dim() not in (2, 3):
             raise ValueError("coords must be shape (B, D) or (B, N, D)")
 
         had_token_dim = coords.dim() == 3
         if not had_token_dim:
-            coords_proc = coords  # (B, D)
+            coords = coords.unsqueeze(1)  # (B, D) -> (B, 1, D)
+
+        B, N, D = coords.shape
+
+        if self.pe_type == "transformer":
+            pe_chunks = []
+            for i in range(D):
+                pe_i = self.pe(coords[..., i])  # (B, N, out_dim)
+                pe_chunks.append(pe_i)
+            ffm = torch.cat(pe_chunks, dim=-1)  # (B, N, D*out_dim)
+            ffm = ffm.view(B * N, -1)
+
+        elif self.pe_type == "log_spaced":
+            coords_flat = coords.view(B * N, D)
             ffm = fourier_feature_mapping(
-                coords_proc,
+                coords_flat,
                 num_bands=self.num_bands,
                 max_freq=self.max_freq,
                 include_input=self.include_input,
                 device=coords.device,
                 base=self.base,
-            )
-            # mlp expects (..., ffm_dim) -> output (..., out_dim)
-            out = self.mlp(ffm)
-            self._last_output = out.detach().cpu()
-            if aggregate == "none":
-                # no token dim to return
-                return out.unsqueeze(1)  # (B, 1, out_dim)
-            return out  # (B, out_dim)
+            )  # (B*N, ffm_dim)
+
+        elif self.pe_type == "gaussian":
+            ffm = self.gaussian_pe(coords)  # (B, N, gauss_pe_dim)
+            ffm = ffm.view(B * N, -1)
+
         else:
-            B, N, D = coords.shape
-            if self.pe_type == 'transformer':
-                ffms=[]
-                for i in range(coords.shape[-1]):
-                    pe = self.pe(coords[...,i])
-                    ffms.append(pe)
-                ffm = torch.cat(ffms,dim=-1)
-                ffm = ffm.view(B*N,-1)
-            elif self.pe_type == 'log_spaced':
-                # flatten batch+tokens for ffm
-                coords_flat = coords.view(B * N, D)
-                ffm = fourier_feature_mapping(
-                    coords_flat,
-                    num_bands=self.num_bands,
-                    max_freq=self.max_freq,
-                    include_input=self.include_input,
-                    device=coords.device,
-                    base=self.base,
-                )  # (B*N, ffm_dim)
-            elif self.pe_type == 'gaussian':
-                ffm = self.guassian_pe(coords)
-                ffm = ffm.view(B,N,-1)
-                #print(ffm.shape)
-            else:
-                raise ValueError("pe_type must be one of 'transformer', 'log_spaced', 'gaussian'")
-            out_flat = self.mlp(ffm)  # (B*N, out_dim)
-            out = out_flat.view(B, N, -1)  # (B, N, out_dim)
-            self._last_output = out.detach().cpu()
+            raise ValueError(
+                "pe_type must be one of 'transformer', 'log_spaced', 'gaussian'"
+            )
+
+        out_flat = self.mlp(ffm)  # (B*N, out_dim)
+        out = out_flat.view(B, N, -1)  # (B, N, out_dim)
+
+        if not had_token_dim:
             if aggregate == "none":
-                return out
-            elif aggregate == "mean":
-                return out.mean(dim=1)  # (B, out_dim)
-            elif aggregate == "max":
-                return out.max(dim=1).values  # (B, out_dim)
+                return out  # (B, 1, out_dim)
             else:
-                raise ValueError("aggregate must be one of 'mean','max','none'")
+                return out.squeeze(1)  # (B, out_dim)
+
+        if aggregate == "none":
+            return out  # (B, N, out_dim)
+        elif aggregate == "mean":
+            return out.mean(dim=1)  # (B, out_dim)
+        elif aggregate == "max":
+            return out.max(dim=1).values  # (B, out_dim)
+        else:
+            raise ValueError("aggregate must be one of 'mean','max','none'")
 
 
 class LAPE(nn.Module):

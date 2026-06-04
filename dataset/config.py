@@ -1,8 +1,8 @@
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--h5File', type=str, default='/data/shared/测试数据/h5/field1031_irregular.h5')
-parser.add_argument('--h5File_regular', type=str, default='/data/shared/测试数据/h5/field1031_label.h5')
+parser.add_argument('--h5File', type=str, default='/NAS/czt/mount/chengzhitong/data/测试数据/h5/field1031_irregular.h5')
+parser.add_argument('--h5File_regular', type=str, default='/NAS/czt/mount/chengzhitong/data/测试数据/h5/field1031_label.h5')
 parser.add_argument('--train_idx_np', type=str, default='/home/chengzhitong/5d_regular/seis_flow_data12V2/generate_py/h5/segc3/segc3_1_info/kept_trace_indices_random_0.5.npy')
 '''parser.add_argument('--h5File_2', type=str, default='/home/chengzhitong/5d_regular/seis_flow_data12V2/generate_py/h5/segc3/segc3_2.h5')
 parser.add_argument('--h5File_regular_2', type=str, default='/home/chengzhitong/5d_regular/seis_flow_data12V2/generate_py/h5/segc3/segc3_2.h5')

@@ -328,6 +328,35 @@ class Downsample(nn.Module):
         _ = t
         return self.conv_list[self.i](x)
 
+class AntiAliasDownsample(nn.Module):
+    """
+    沿时间轴 (W) 的反锯齿 1D 下采样。
+    两步分离: groups=n_channels 可学习低通滤波 -> AvgPool2d 固定 stride。
+    高斯初始化保证初始行为 = 经典 BlurPool。
+    接受 (x, t) 签名与 Resblock 保持一致 (t 忽略)。
+    """
+    def __init__(self, n_channels, stride=2, aa_kernel_size=5, learnable=False):
+        super().__init__()
+        self.antialias = nn.Conv2d(
+            n_channels, n_channels,
+            kernel_size=(1, aa_kernel_size),
+            padding=(0, aa_kernel_size // 2),
+            groups=n_channels, bias=False
+        )
+        sigma = float(aa_kernel_size) / 6.0
+        t_c = torch.arange(aa_kernel_size, dtype=torch.float32) - aa_kernel_size // 2
+        g = torch.exp(-0.5 * (t_c / sigma) ** 2)
+        g = g / g.sum()
+        self.antialias.weight.data.copy_(
+            g.view(1, 1, 1, -1).expand(n_channels, 1, 1, -1))
+        if not learnable:
+            self.antialias.weight.requires_grad_(False)
+        self.down = nn.AvgPool2d((1, stride))
+
+    def forward(self, x, t=None):
+        return self.down(self.antialias(x))
+
+
 class WidthUpsample1D(nn.Module):
     def __init__(self, in_channels,out_channels,width_scale):
         super().__init__()
@@ -387,6 +416,28 @@ class Upsample(nn.Module):
     def forward(self, x: torch.Tensor, t: torch.Tensor):
         _ = t
         return self.conv_list[self.i](x)
+
+
+class InterpUpsample1D(nn.Module):
+    """
+    沿时间轴 (W) 的上采样: 双线性插值 + 可学习 refine 卷积。
+    dirac 初始化 -> 训练初期 = 纯双线性, 逐步学习高频补偿。
+    接受 (x, t) 签名与 Resblock 保持一致 (t 忽略)。
+    """
+    def __init__(self, n_channels, stride=2):
+        super().__init__()
+        self.stride = stride
+        self.refine = nn.Conv2d(
+            n_channels, n_channels,
+            kernel_size=(1, 3), padding=(0, 1), bias=True
+        )
+        nn.init.dirac_(self.refine.weight)
+        nn.init.zeros_(self.refine.bias)
+
+    def forward(self, x, t=None):
+        x = F.interpolate(x, scale_factor=(1, self.stride),
+                          mode='bilinear', align_corners=False)
+        return self.refine(x)
 
 
 # ========== Trace-axis global attention ==========
@@ -865,10 +916,15 @@ class TimeAxisAttention1D(nn.Module):
             win = W
             shift = 0
         elif W % win != 0:
+            found = False
             for d in range(win, 1, -1):
                 if W % d == 0:
                     win = d
+                    found = True
                     break
+            if not found:
+                win = W
+                shift = 0
             shift = shift if shift < win else win // 2
         assert W % win == 0, f"W must be divisible by win: W={W}, win={win}"
 
@@ -1169,17 +1225,17 @@ class SeisDiT(torch.nn.Module):
             x= atten(x,fourier_emb)
         shift, scale = self.adaLN_modulation(fourier_emb).chunk(2, dim=-1)
         x = modulate(self.norm_final(x), shift.unsqueeze(-2), scale.unsqueeze(-2))
-        x = x.permute(0,3,1,2).contiguous()
-        x = self.to_unet(x)#+h0
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = self.to_unet(x)
         for m in self.up:
             if isinstance(m, Upsample):
                 x = m(x, t)
             else:
                 s = h.pop()
                 x = torch.cat((x, s), dim=1)
-                x = m(x, t)           
-        x=self.final(self.ac(self.norm(x)))
-        return x   
+                x = m(x, t)
+        x = self.final(self.ac(self.norm(x)))
+        return x
 
 
 class SeisDiTRope(torch.nn.Module):
@@ -1344,7 +1400,7 @@ class SeisDiTRope(torch.nn.Module):
         
         x = modulate(self.norm_final(x), shift.unsqueeze(-2), scale.unsqueeze(-2))
         x = x.permute(0, 3, 1, 2).contiguous()
-        x = self.to_unet(x)
+        x = self.to_unet(x)#+h0
         for m in self.up:
             if isinstance(m, Upsample):
                 x = m(x, t)
@@ -1374,8 +1430,9 @@ class SeisDiTRopeV2(torch.nn.Module):
         output_channels=1,
         res_blocks=2,
         strides=[2,2,2,1],
-        f_dict=None,
-        pe_type='transformer',
+        mlp_ratio=2.5,
+        num_bands=16,
+        max_freq=128,
         geom_mode: str = "relative",
         missing_focus_adapter: bool = True,
     ):
@@ -1392,7 +1449,7 @@ class SeisDiTRopeV2(torch.nn.Module):
         self.missing_focus_adapter = missing_focus_adapter
 
         self.fourier_encoder = Seismic5DEncoder(
-            coord_dim=4, num_bands=32, max_freq=128,
+            coord_dim=4, num_bands=num_bands, max_freq=max_freq,
             include_input=True, out_dim=d_model, pe_type='log_spaced',
         )
 
@@ -1420,9 +1477,9 @@ class SeisDiTRopeV2(torch.nn.Module):
         attenL = []
         for i in range(num_layers):
             if i % 2 == 0:
-                attenL.append(DiTBlockTrace(hidden_size=d_model, num_heads=nhead))
+                attenL.append(DiTBlockTrace(hidden_size=d_model, num_heads=nhead, mlp_ratio=mlp_ratio))
             else:
-                attenL.append(DiTBlockTime(hidden_size=d_model, num_heads=nhead))
+                attenL.append(DiTBlockTime(hidden_size=d_model, num_heads=nhead, mlp_ratio=mlp_ratio))
         self.attenL = torch.nn.ModuleList(attenL)
 
         self.norm_final = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
@@ -1441,7 +1498,7 @@ class SeisDiTRopeV2(torch.nn.Module):
                 down.append(Resblock(in_channels, out_channels, d_model, kernel_size=(1, 7)))
                 in_channels = out_channels
             if i < n_res - 1:
-                down.append(Downsample(in_channels, i, strides[i]))
+                down.append(AntiAliasDownsample(in_channels, strides[i]))
 
         self.down = torch.nn.ModuleList(down)
         up = []
@@ -1454,7 +1511,7 @@ class SeisDiTRopeV2(torch.nn.Module):
             up.append(Resblock(in_channels + out_channels, out_channels, d_model, kernel_size=(1, 7)))
             in_channels = out_channels
             if i > 0:
-                up.append(Upsample(in_channels, i - 1, strides[i - 1]))
+                up.append(InterpUpsample1D(in_channels, strides[i - 1]))
         self.up = torch.nn.ModuleList(up)
         self.ac = MYact()
         self.norm = nn.InstanceNorm2d(in_channels, affine=True)
@@ -1538,7 +1595,7 @@ class SeisDiTRopeV2(torch.nn.Module):
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.to_unet(x)
         for m in self.up:
-            if isinstance(m, Upsample):
+            if isinstance(m, InterpUpsample1D):
                 x = m(x, t)
             else:
                 s = h.pop()
@@ -1549,39 +1606,36 @@ class SeisDiTRopeV2(torch.nn.Module):
 
 # ========== 测试代码 ==========
 if __name__ == "__main__":
-    device = torch.device("cpu" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
     
     # ===== 1. 构造模型实例 =====
-    model = SeisDiTRope(
+    model = SeisDiTRopeV2(
         image_channels=2,
         n_channels=64,
-        channel=[1,2,4,8],
+        channel=[1,2,2,2],
         d_model=512,
         nhead=8,
         dropout=0.1,
-        num_layers=4,  # 测试时使用较小的层数
+        num_layers=4,
         output_channels=1,
         res_blocks=2,
         strides=[2,2,2,1],
-        pe_type="transformer",
+        mlp_ratio=2.5,
+        num_bands=16,
     ).to(device)
     
     model.eval()
     
     # ===== 2. 构造测试数据 =====
-    B = 2          # batch size
-    C = 2          # input channels
-    H = 32         # trace 方向长度（深度）
-    W = 128        # time 方向长度
+    B = 2
+    C = 2
+    H = 128        # trace dimension (must match training)
+    W = 256        # time dimension (must be divisible by prod(strides) = 8)
     
-    # 输入地震数据
     x = torch.randn(B, C, H, W, device=device)
-    
-    # 扩散时间步
     t = torch.randint(0, 1000, (B,), device=device).float()
     
-    # 几何信息（条件）
     rx = torch.randn(B, H, device=device)
     ry = torch.randn(B, H, device=device)
     sx = torch.randn(B, H, device=device)
@@ -1593,17 +1647,17 @@ if __name__ == "__main__":
     with torch.no_grad():
         y = model(x, t, condL=condL)
     
-    # ===== 4. 验证输出 =====
-    print(f"输入形状: {x.shape}")   # [B, C, H, W]
-    print(f"输出形状: {y.shape}")   # 期望 [B, 1, H, W]
+    print(f"输入形状: {x.shape}")
+    print(f"输出形状: {y.shape}")
     
-    # 断言检查
     assert y.shape == (B, 1, H, W), \
         f"输出形状不匹配！期望 {(B, 1, H, W)}，实际 {y.shape}"
     assert not torch.isnan(y).any(), "输出包含 NaN 值！"
     assert not torch.isinf(y).any(), "输出包含 Inf 值！"
     
     print("✓ 测试通过！")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  - 模型参数量: {n_params / 1e6:.2f}M")
     print(f"  - 输入形状: {x.shape}")
     print(f"  - 输出形状: {y.shape}")
-    print(f"  - 模型使用 Trace-axis global attention")
+    print(f"  - 使用 AntiAliasDownsample + InterpUpsample1D")

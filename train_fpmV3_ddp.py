@@ -217,6 +217,18 @@ def config():
         help="Weight for multiscale loss",
     )
     parser.add_argument(
+        "--use_spectral_loss",
+        type=str2bool,
+        default=False,
+        help="Use 1D spectral (FFT) loss for high-frequency reconstruction",
+    )
+    parser.add_argument(
+        "--spec_weight",
+        type=float,
+        default=0.01,
+        help="Weight for spectral loss",
+    )
+    parser.add_argument(
         "--sampling_method",
         type=str,
         default="ode",
@@ -878,10 +890,11 @@ def main():
         model_unet = SeisDiTRopeV2(
             image_channels=2,
             n_channels=32,
-            f_dict=None,
             num_layers=8,
-            d_model=512,
-            pe_type=pe_type,
+            d_model=384,
+            nhead=8,
+            mlp_ratio=4,
+            num_bands=16,
             missing_focus_adapter=args.use_missing_embedding,
             geom_mode=args.geom_mode,
         )
@@ -938,6 +951,8 @@ def main():
         sde_num_steps=fpm_kwargs["sde_num_steps"],
         use_multiscale_loss=args.use_multiscale_loss,
         multiscale_loss_weight=args.multiscale_loss_weight,
+        use_spectral_loss=args.use_spectral_loss,
+        spec_weight=args.spec_weight,
     )
 
     # 只在主进程创建结果目录

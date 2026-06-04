@@ -44,6 +44,8 @@ SDE_SAMPLING_METHOD="${SDE_SAMPLING_METHOD:-Euler}"
 SDE_NUM_STEPS="${SDE_NUM_STEPS:-250}"
 
 # Model hyperparams — must match training
+MLP_RATIO="${MLP_RATIO:-4}"
+NUM_BANDS="${NUM_BANDS:-16}"
 USE_MISSING_EMBEDDING="${USE_MISSING_EMBEDDING:-false}"
 USE_ENERGY_MLP="${USE_ENERGY_MLP:-false}"
 HEADWISE_ATTN_OUTPUT_GATE="${HEADWISE_ATTN_OUTPUT_GATE:-true}"
@@ -87,6 +89,8 @@ cmd=(
   --headwise_attn_output_gate "${HEADWISE_ATTN_OUTPUT_GATE}"
   --elementwise_attn_output_gate "${ELEMENTWISE_ATTN_OUTPUT_GATE}"
   --geom_mode "${GEOM_MODE}"
+  --mlp_ratio "${MLP_RATIO}"
+  --num_bands "${NUM_BANDS}"
   --use_p_scale "${USE_P_SCALE}"
   --chunk_length_flow "${CHUNK_LENGTH_FLOW}"
   --visualize "${VISUALIZE}"

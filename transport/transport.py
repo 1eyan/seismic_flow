@@ -142,6 +142,8 @@ class Transport:
         terms = {}
         terms['pred'] = model_output
         terms['ut'] = ut
+        terms['t'] = t
+        terms['xt'] = xt
         if self.model_type == ModelType.VELOCITY:
             if self.loss_type == WeightType.LOGITNORMAL:
                 weight = path.expand_t_like_x(t, xt) * (1.0 - path.expand_t_like_x(t, xt)) + 1e-4

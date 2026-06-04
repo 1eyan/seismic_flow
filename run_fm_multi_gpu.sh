@@ -20,11 +20,11 @@
 
 
 MODEL_NAME="trace_axis"
-BATCH_SIZE=8
+BATCH_SIZE=3
 LR=1e-4
 EPOCHS=200
 MODEL_TYPE="trace_axis"  # trace_axis | gated | tp
-SEED=515
+SEED=0303
 DATA_TYPE="field1031"
 SEGY_PROFILE="${SEGY_PROFILE:-field1031}"  # sw06 | field1031 | segc3
 USE_P_SCALE="${USE_P_SCALE:-true}"
@@ -38,6 +38,8 @@ PREDICTION="${PREDICTION:-velocity}"  # velocity | score | noise
 LOSS_WEIGHT="${LOSS_WEIGHT:-logitnormal}"  # None | velocity | likelihood | logitnormal
 USE_MULTISCALE_LOSS="${USE_MULTISCALE_LOSS:-true}"
 MULTISCALE_LOSS_WEIGHT="${MULTISCALE_LOSS_WEIGHT:-0.1}"
+USE_SPECTRAL_LOSS="${USE_SPECTRAL_LOSS:-true}"
+SPEC_WEIGHT="${SPEC_WEIGHT:-0.01}"
 SAMPLING_METHOD="${SAMPLING_METHOD:-ode}"  # ode | sde
 ODE_NUM_STEPS="${ODE_NUM_STEPS:-50}"
 SDE_NUM_STEPS="${SDE_NUM_STEPS:-250}"
@@ -57,6 +59,7 @@ echo "geom_mode: $GEOM_MODE"
 echo "use_p_scale: $USE_P_SCALE"
 echo "loss_weight: $LOSS_WEIGHT"
 echo "use_multiscale_loss: $USE_MULTISCALE_LOSS"
+echo "use_spectral_loss: $USE_SPECTRAL_LOSS"
 echo "pretrained: ${PRETRAINED:-none}"
 echo "pretrained_strict: $PRETRAINED_STRICT"
 echo "======================================"
@@ -82,6 +85,8 @@ accelerate launch --config_file accelerate_config.yaml --main_process_port 29501
     --loss_weight $LOSS_WEIGHT \
     --use_multiscale_loss $USE_MULTISCALE_LOSS \
     --multiscale_loss_weight $MULTISCALE_LOSS_WEIGHT \
+    --use_spectral_loss $USE_SPECTRAL_LOSS \
+    --spec_weight $SPEC_WEIGHT \
     --sampling_method $SAMPLING_METHOD \
     --ode_num_steps $ODE_NUM_STEPS \
     --sde_num_steps $SDE_NUM_STEPS \

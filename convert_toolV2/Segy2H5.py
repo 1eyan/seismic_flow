@@ -64,10 +64,10 @@ def read_headers_pure_python_fixed(path: Path, byte_pos=None):
     if byte_pos is None:
         byte_pos = BYTE_POS
     out = {'trace': []}
-    for key in byte_pos.keys():
+    for key in byte_pos:
         out[key] = []
     with open(path, 'rb') as f:
-        fmt, _ = _read_bin_header_format_and_ns(f)
+        fmt, ns_bin = _read_bin_header_format_and_ns(f)
         bps = _bps_from_fmt(fmt)
         f.seek(3600, 0)
         t = 0
@@ -79,20 +79,9 @@ def read_headers_pure_python_fixed(path: Path, byte_pos=None):
                 j0 = pos1b - 1
                 return struct.unpack('>i', hdr[j0:j0+4])[0]
             out['trace'].append(t)
-            out['shot_line'].append(i32be(byte_pos['shot_line']))
-            out['shot_no'].append(i32be(byte_pos['shot_no']))
-            out['recv_line'].append(i32be(byte_pos['recv_line']))
-            out['recv_no'].append(i32be(byte_pos['recv_no']))
-            out['shot_x'].append(i32be(byte_pos['shot_x']))
-            out['shot_y'].append(i32be(byte_pos['shot_y']))
-            out['rec_x'].append(i32be(byte_pos['rec_x']))
-            out['rec_y'].append(i32be(byte_pos['rec_y']))
-            out['shot_stake'].append(i32be(byte_pos['shot_stake']))
-            out['recv_stake'].append(i32be(byte_pos['recv_stake']))
-            out['cmp'].append(i32be(byte_pos['cmp']))
-            out['cmp_line'].append(i32be(byte_pos['cmp_line']))
-            out['offset'].append(i32be(byte_pos['offset']))
-            ns = struct.unpack('>H', hdr[114:116])[0]
+            for key, pos in byte_pos.items():
+                out[key].append(i32be(pos))
+            ns = struct.unpack('>H', hdr[114:116])[0] or ns_bin
             f.seek(ns * bps, 1)
             t += 1
     return pd.DataFrame(out)
@@ -108,7 +97,7 @@ def read_headers_pure_self_computed(path: Path, byte_pos=None):
         'rec_y': [],
     }
     with open(path, 'rb') as f:
-        fmt, _ = _read_bin_header_format_and_ns(f)
+        fmt, ns_bin = _read_bin_header_format_and_ns(f)
         bps = _bps_from_fmt(fmt)
         f.seek(3600, 0)
         t = 0
@@ -124,7 +113,7 @@ def read_headers_pure_self_computed(path: Path, byte_pos=None):
             out['shot_y'].append(i32be(byte_pos['shot_y']))
             out['rec_x'].append(i32be(byte_pos['rec_x']))
             out['rec_y'].append(i32be(byte_pos['rec_y']))
-            ns = struct.unpack('>H', hdr[114:116])[0]
+            ns = struct.unpack('>H', hdr[114:116])[0] or ns_bin
             f.seek(ns * bps, 1)
             t += 1
     return pd.DataFrame(out)
@@ -147,7 +136,7 @@ def organize_traces(input_segy, headers_df=None, sort_keys=None, mode='self_comp
 
     with segyio.open(input_segy, ignore_geometry=True) as f:
         data = f.trace.raw[:]
-        scalar = np.abs(f.attributes(segyio.TraceField.SourceGroupScalar)[:].astype(np.float32))
+        scalar_raw = f.attributes(segyio.TraceField.SourceGroupScalar)[:].astype(np.float32)
         delta = f.attributes(segyio.TraceField.TRACE_SAMPLE_INTERVAL)[:].astype(np.float32) / 1000.0
         t0 = f.attributes(segyio.TraceField.DelayRecordingTime)[:].astype(np.float32) / 1000.0
 
@@ -155,11 +144,37 @@ def organize_traces(input_segy, headers_df=None, sort_keys=None, mode='self_comp
         headers = read_headers_pure_python_fixed(Path(input_segy), byte_pos=byte_pos) if headers_df is None else headers_df.copy()
     else:
         headers = read_headers_pure_self_computed(Path(input_segy), byte_pos=bp_coords) if headers_df is None else headers_df.copy()
-    print(headers.head())
-    if sort_keys is None:
-        sort_keys = _PROFILE.sort_keys
     if 'trace' not in headers.columns:
         raise ValueError("headers_df 必须包含 'trace' 列")
+
+    if mode == 'self_computed':
+        trace_for_scalar = headers['trace'].to_numpy(dtype=np.intp)
+        scalar_for_headers = scalar_raw[trace_for_scalar].copy()
+        scalar_for_headers[scalar_for_headers == 0] = 1.0
+        if 'shot_line' not in headers:
+            headers['shot_line'] = np.rint(_scale_coords(
+                headers['shot_y'].to_numpy(dtype=np.float32), scalar_for_headers)).astype(np.int32)
+        if 'shot_no' not in headers:
+            headers['shot_no'] = np.rint(_scale_coords(
+                headers['shot_x'].to_numpy(dtype=np.float32), scalar_for_headers)).astype(np.int32)
+        if 'recv_line' not in headers:
+            headers['recv_line'] = np.rint(_scale_coords(
+                headers['rec_y'].to_numpy(dtype=np.float32), scalar_for_headers)).astype(np.int32)
+        if 'recv_no' not in headers:
+            headers['recv_no'] = np.rint(_scale_coords(
+                headers['rec_x'].to_numpy(dtype=np.float32), scalar_for_headers)).astype(np.int32)
+        if 'shot_stake' not in headers:
+            headers['shot_stake'] = headers['shot_no']
+        if 'recv_stake' not in headers:
+            headers['recv_stake'] = headers['recv_no']
+
+    if sort_keys is None:
+        sort_keys = _PROFILE.sort_keys
+    missing_sort = [k for k in sort_keys if k not in headers.columns]
+    if missing_sort:
+        raise ValueError(f"sort_keys 中包含道头中不存在的字段: {missing_sort}")
+
+    print(headers.head())
     trace_idx_old = headers['trace'].to_numpy(dtype=np.intp)
     headers = headers.sort_values(by=list(sort_keys)).reset_index(drop=True)
     trace_idx = headers['trace'].to_numpy(dtype=np.intp)
@@ -168,18 +183,28 @@ def organize_traces(input_segy, headers_df=None, sort_keys=None, mode='self_comp
     else:
         print('sort_headers is needed')
     n_traces = data.shape[0]
+    if len(headers) != n_traces:
+        raise ValueError(
+            f"道头解析数 ({len(headers)}) 与 segyio 读取道数 ({n_traces}) 不匹配。"
+            f" 文件: {input_segy}"
+        )
+    if headers_df is not None and len(headers_df) != n_traces:
+        raise ValueError(
+            f"传入道头数 ({len(headers_df)}) 与数据道数 ({n_traces}) 不匹配。"
+            f" 文件: {input_segy}"
+        )
     if trace_idx.min() < 0 or trace_idx.max() >= n_traces:
         raise ValueError(f"trace 索引越界，合法范围是 [0, {n_traces - 1}]")
 
-    scalar = scalar[trace_idx]
+    scalar = scalar_raw[trace_idx]
     scalar[scalar == 0] = 1.0
     if mode == 'fixed':
         out = {
             'data': data[trace_idx],
-            'sx': headers['shot_x'].to_numpy(dtype=np.float32) / scalar,
-            'sy': headers['shot_y'].to_numpy(dtype=np.float32) / scalar,
-            'rx': headers['rec_x'].to_numpy(dtype=np.float32) / scalar,
-            'ry': headers['rec_y'].to_numpy(dtype=np.float32) / scalar,
+            'sx': _scale_coords(headers['shot_x'].to_numpy(dtype=np.float32), scalar),
+            'sy': _scale_coords(headers['shot_y'].to_numpy(dtype=np.float32), scalar),
+            'rx': _scale_coords(headers['rec_x'].to_numpy(dtype=np.float32), scalar),
+            'ry': _scale_coords(headers['rec_y'].to_numpy(dtype=np.float32), scalar),
             'delta':delta[trace_idx],
             't0': t0[trace_idx],
             'shot_line': headers['shot_line'].to_numpy(dtype=np.int32),
@@ -194,22 +219,23 @@ def organize_traces(input_segy, headers_df=None, sort_keys=None, mode='self_comp
             'trace_idx': headers['trace'].to_numpy(dtype=np.int32),
         }
     elif mode == 'self_computed':
+        s_vals = scalar
         out = {
             'data': data[trace_idx],
-            'sx': _scale_coords(headers['shot_x'].to_numpy(dtype=np.float32), scalar),
-            'sy': _scale_coords(headers['shot_y'].to_numpy(dtype=np.float32), scalar),
-            'rx': _scale_coords(headers['rec_x'].to_numpy(dtype=np.float32), scalar),
-            'ry': _scale_coords(headers['rec_y'].to_numpy(dtype=np.float32), scalar),
+            'sx': _scale_coords(headers['shot_x'].to_numpy(dtype=np.float32), s_vals),
+            'sy': _scale_coords(headers['shot_y'].to_numpy(dtype=np.float32), s_vals),
+            'rx': _scale_coords(headers['rec_x'].to_numpy(dtype=np.float32), s_vals),
+            'ry': _scale_coords(headers['rec_y'].to_numpy(dtype=np.float32), s_vals),
             'sx_original': headers['shot_x'].to_numpy(dtype=np.float32),
             'sy_original': headers['shot_y'].to_numpy(dtype=np.float32),
             'rx_original': headers['rec_x'].to_numpy(dtype=np.float32),
             'ry_original': headers['rec_y'].to_numpy(dtype=np.float32),
             'delta':delta[trace_idx],
             't0': t0[trace_idx],
-            'shot_line': pd.Series(np.rint(_scale_coords(headers['shot_y'].to_numpy(dtype=np.float32), scalar)), dtype="Int64"),
-            'shot_no': pd.Series(np.rint(_scale_coords(headers['shot_x'].to_numpy(dtype=np.float32), scalar)), dtype="Int64"),
-            'recv_line': pd.Series(np.rint(_scale_coords(headers['rec_y'].to_numpy(dtype=np.float32), scalar)), dtype="Int64"),
-            'recv_no': pd.Series(np.rint(_scale_coords(headers['rec_x'].to_numpy(dtype=np.float32), scalar)), dtype="Int64"),
+            'shot_line': headers['shot_line'].to_numpy(dtype=np.int32),
+            'shot_no':   headers['shot_no'].to_numpy(dtype=np.int32),
+            'recv_line': headers['recv_line'].to_numpy(dtype=np.int32),
+            'recv_no':   headers['recv_no'].to_numpy(dtype=np.int32),
             'trace_idx': headers['trace'].to_numpy(dtype=np.int32),
         }
     else:
@@ -391,6 +417,9 @@ def segy2h5(h5_file, input_segy, group_name='1551', headers_df=None, sort_keys=N
     block = organize_traces(input_segy, headers_df=headers_df, sort_keys=sort_keys, mode=mode, byte_pos=byte_pos)
     with h5.File(h5_file, 'w') as h5f:
         g = h5f.create_group(group_name)
+        g.attrs['segy_profile'] = _PROFILE.name
+        g.attrs['segy_mode'] = mode
+        g.attrs['sort_keys'] = ','.join(sort_keys)
         g.create_dataset('data', data=block['data'], compression='gzip')
         g.create_dataset('sx', data=block['sx'], compression='gzip')
         g.create_dataset('sy', data=block['sy'], compression='gzip')
@@ -517,6 +546,8 @@ def convert_segy_triple(
         headers_df = read_headers_pure_python_fixed(Path(irr_segy))
     else:
         headers_df = read_headers_pure_self_computed(Path(irr_segy))
+    n_irr_headers = len(headers_df)
+    print(f"[convert_segy_triple]   -> {n_irr_headers} traces")
 
     conversions = [
         ('irregular', irr_segy, output_files['irregular']),
@@ -531,10 +562,11 @@ def convert_segy_triple(
             continue
         print(f"[convert_segy_triple] Converting {tag}: {segy_path} -> {h5_path}")
         t0 = time.time()
+        # 每个文件独立读道头排序，只对 irregular 传入预读取的 headers_df
         segy2h5(
             h5_file=h5_path,
             input_segy=segy_path,
-            headers_df=headers_df,
+            headers_df=headers_df if tag == 'irregular' else None,
             group_name=group_name,
             sort_keys=sort_keys,
             mode=mode,

@@ -1,9 +1,27 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
-# 添加 SiT-main 路径以导入 transport 模块
-#sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'SiT-main'))
 from transport import create_transport, Sampler
+
+
+def spectral_loss_1d(pred, target, alpha=1.0):
+    """
+    沿时间轴 (W) 的 1D 频域损失, 高频加权。
+
+    Args:
+        pred, target: [B, 1, H, W] — 速度场或重建数据
+        alpha: 高频强调系数 (0=均匀, 1=Nyquist 处权重翻倍)
+    Returns:
+        scalar loss
+    """
+    pred_fft = torch.fft.rfft(pred, dim=-1, norm='ortho')
+    target_fft = torch.fft.rfft(target, dim=-1, norm='ortho')
+    n_freqs = pred_fft.shape[-1]
+    freqs = torch.linspace(0, 1, n_freqs, device=pred.device)
+    weight = 1.0 + alpha * freqs
+    diff = (pred_fft - target_fft).abs()
+    return (weight.view(1, 1, 1, -1) * diff).mean()
 
 
 class FlowMatchingModel(nn.Module):
@@ -44,6 +62,10 @@ class FlowMatchingModel(nn.Module):
         sde_last_step_size: float = 0.04,
         use_multiscale_loss: bool = False,
         multiscale_loss_weight: float = 0.1,
+        # Spectral loss parameters
+        use_spectral_loss: bool = False,
+        spec_weight: float = 0.01,
+        spec_alpha: float = 1.0,
     ) -> None:
         """
         Initialize Flow Matching Model.
@@ -101,6 +123,10 @@ class FlowMatchingModel(nn.Module):
 
         self.use_multiscale_loss = use_multiscale_loss
         self.multiscale_loss_weight = multiscale_loss_weight
+
+        self.use_spectral_loss = use_spectral_loss
+        self.spec_weight = spec_weight
+        self.spec_alpha = spec_alpha
         
         # Create transport object
         self.transport = create_transport(
@@ -231,6 +257,13 @@ class FlowMatchingModel(nn.Module):
                 0.5 * torch.nn.functional.mse_loss(pred_d2, ut_d2) +
                 0.2 * torch.nn.functional.mse_loss(pred_d4, ut_d4)
             )
+
+        if self.use_spectral_loss:
+            t_val = loss_dict['t']
+            xt = loss_dict['xt']
+            pred = loss_dict['pred']
+            x1_hat = xt + (1.0 - t_val[:, None, None, None]) * pred
+            loss = loss + self.spec_weight * spectral_loss_1d(x1_hat, x, alpha=self.spec_alpha)
 
         return loss
     

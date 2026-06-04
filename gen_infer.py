@@ -468,10 +468,11 @@ def make_backbone(args: argparse.Namespace) -> torch.nn.Module:
         return SeisDiTRopeV2(
             image_channels=2,
             n_channels=32,
-            f_dict=None,
             num_layers=8,
-            d_model=512,
-            pe_type="transformer",
+            d_model=384,
+            nhead=8,
+            mlp_ratio=getattr(args, 'mlp_ratio', 2.5),
+            num_bands=getattr(args, 'num_bands', 16),
             missing_focus_adapter=args.use_missing_embedding,
             geom_mode=args.geom_mode,
         )
@@ -839,6 +840,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headwise_attn_output_gate", type=str2bool, default=True)
     parser.add_argument("--elementwise_attn_output_gate", type=str2bool, default=False)
     parser.add_argument("--geom_mode", choices=["source", "receiver", "relative"], default="source")
+    parser.add_argument("--mlp_ratio", type=float, default=2.5, help="MLP ratio for DiT blocks (must match training)")
+    parser.add_argument("--num_bands", type=int, default=16, help="Fourier frequency bands (must match training)")
     parser.add_argument("--use_p_scale", type=str2bool, default=False, help="apply p_scale to gated model RoPE coordinates")
     parser.add_argument("--gated_encdec_mem_bottleneck_layers", type=int, default=2, help="memory bottleneck layers for gated_encdec model")
 
