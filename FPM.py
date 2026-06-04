@@ -42,6 +42,8 @@ class FlowMatchingModel(nn.Module):
         sde_diffusion_norm: float = 1.0,
         sde_last_step: str = "Mean",
         sde_last_step_size: float = 0.04,
+        use_multiscale_loss: bool = False,
+        multiscale_loss_weight: float = 0.1,
     ) -> None:
         """
         Initialize Flow Matching Model.
@@ -96,6 +98,9 @@ class FlowMatchingModel(nn.Module):
         self.sde_diffusion_norm = sde_diffusion_norm
         self.sde_last_step = sde_last_step
         self.sde_last_step_size = sde_last_step_size
+
+        self.use_multiscale_loss = use_multiscale_loss
+        self.multiscale_loss_weight = multiscale_loss_weight
         
         # Create transport object
         self.transport = create_transport(
@@ -214,7 +219,19 @@ class FlowMatchingModel(nn.Module):
         # Compute loss using transport
         loss_dict = self.transport.training_losses(wrapped_model, x, model_kwargs)
         loss = loss_dict['loss'].mean()
-        
+
+        if self.use_multiscale_loss:
+            pred = loss_dict['pred']
+            ut = loss_dict['ut']
+            pred_d2 = torch.nn.functional.avg_pool2d(pred, kernel_size=2)
+            ut_d2 = torch.nn.functional.avg_pool2d(ut, kernel_size=2)
+            pred_d4 = torch.nn.functional.avg_pool2d(pred, kernel_size=4)
+            ut_d4 = torch.nn.functional.avg_pool2d(ut, kernel_size=4)
+            loss = loss + self.multiscale_loss_weight * (
+                0.5 * torch.nn.functional.mse_loss(pred_d2, ut_d2) +
+                0.2 * torch.nn.functional.mse_loss(pred_d4, ut_d4)
+            )
+
         return loss
     
     @torch.inference_mode()

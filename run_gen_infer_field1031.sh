@@ -13,6 +13,7 @@ cd "${ROOT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"  # >1 enables DDP via torchrun
 DEVICE="${DEVICE:-cuda:0}"  # only used in single-GPU mode
+MASTER_PORT="${MASTER_PORT:-29503}"
 
 CHECKPOINT="${CHECKPOINT:-/home/chengzhitong/5d_regular/seismic_flow/resultsFPM/trace_axis_datatype_field1031_0517/checkpoints/model-epoch-190.pth}"
 H5_REGULAR="${H5_REGULAR:-/data/shared/测试数据/h5/field1031_label.h5}"
@@ -113,7 +114,7 @@ fi
 
 # Build launch command
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
-  LAUNCHER=(torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port 29502)
+  LAUNCHER=(torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port 29503)
 else
   LAUNCHER=("${PYTHON_BIN}")
   cmd+=(--device "${DEVICE}")

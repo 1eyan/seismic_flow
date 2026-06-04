@@ -201,8 +201,20 @@ def config():
         "--loss_weight",
         type=str,
         default=None,
-        choices=[None, "velocity", "likelihood"],
+        choices=[None, "velocity", "likelihood", "logitnormal"],
         help="Loss weighting type",
+    )
+    parser.add_argument(
+        "--use_multiscale_loss",
+        type=str2bool,
+        default=False,
+        help="Use multiscale loss (downsampled supervision)",
+    )
+    parser.add_argument(
+        "--multiscale_loss_weight",
+        type=float,
+        default=0.1,
+        help="Weight for multiscale loss",
     )
     parser.add_argument(
         "--sampling_method",
@@ -717,7 +729,7 @@ def main():
 
     accelerator = Accelerator(
         gradient_accumulation_steps=1,
-        mixed_precision="fp16",  # 可以改为 'fp16' 或 'bf16' 来加速训练
+        mixed_precision="bf16",  # 可以改为 'fp16' 或 'bf16' 来加速训练
         kwargs_handlers=[ddp_kwargs],
     )
 
@@ -924,6 +936,8 @@ def main():
         sampling_method=fpm_kwargs["sampling_method"],
         ode_num_steps=fpm_kwargs["ode_num_steps"],
         sde_num_steps=fpm_kwargs["sde_num_steps"],
+        use_multiscale_loss=args.use_multiscale_loss,
+        multiscale_loss_weight=args.multiscale_loss_weight,
     )
 
     # 只在主进程创建结果目录

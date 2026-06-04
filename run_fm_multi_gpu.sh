@@ -35,6 +35,9 @@ HEADWISE_ATTN_OUTPUT_GATE="${HEADWISE_ATTN_OUTPUT_GATE:-true}"
 ELEMENTWISE_ATTN_OUTPUT_GATE="${ELEMENTWISE_ATTN_OUTPUT_GATE:-false}"
 PATH_TYPE="${PATH_TYPE:-Linear}"  # Linear | GVP | VP
 PREDICTION="${PREDICTION:-velocity}"  # velocity | score | noise
+LOSS_WEIGHT="${LOSS_WEIGHT:-logitnormal}"  # None | velocity | likelihood | logitnormal
+USE_MULTISCALE_LOSS="${USE_MULTISCALE_LOSS:-true}"
+MULTISCALE_LOSS_WEIGHT="${MULTISCALE_LOSS_WEIGHT:-0.1}"
 SAMPLING_METHOD="${SAMPLING_METHOD:-ode}"  # ode | sde
 ODE_NUM_STEPS="${ODE_NUM_STEPS:-50}"
 SDE_NUM_STEPS="${SDE_NUM_STEPS:-250}"
@@ -52,6 +55,8 @@ echo "Data Type: $DATA_TYPE"
 echo "segy_profile: $SEGY_PROFILE"
 echo "geom_mode: $GEOM_MODE"
 echo "use_p_scale: $USE_P_SCALE"
+echo "loss_weight: $LOSS_WEIGHT"
+echo "use_multiscale_loss: $USE_MULTISCALE_LOSS"
 echo "pretrained: ${PRETRAINED:-none}"
 echo "pretrained_strict: $PRETRAINED_STRICT"
 echo "======================================"
@@ -74,6 +79,9 @@ accelerate launch --config_file accelerate_config.yaml --main_process_port 29501
     --elementwise_attn_output_gate $ELEMENTWISE_ATTN_OUTPUT_GATE \
     --path_type $PATH_TYPE \
     --prediction $PREDICTION \
+    --loss_weight $LOSS_WEIGHT \
+    --use_multiscale_loss $USE_MULTISCALE_LOSS \
+    --multiscale_loss_weight $MULTISCALE_LOSS_WEIGHT \
     --sampling_method $SAMPLING_METHOD \
     --ode_num_steps $ODE_NUM_STEPS \
     --sde_num_steps $SDE_NUM_STEPS \

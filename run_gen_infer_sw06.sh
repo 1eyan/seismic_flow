@@ -10,25 +10,25 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=5,6,7
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-4}"  # >1 enables DDP via torchrun
+NPROC_PER_NODE="${NPROC_PER_NODE:-3}"  # >1 enables DDP via torchrun
 DEVICE="${DEVICE:-cuda:0}"  # only used in single-GPU mode
 
-CHECKPOINT="${CHECKPOINT:-${ROOT_DIR}/resultsFPM/trace_axis_datatype_sw06_0517/checkpoints/model-epoch-140.pth}"
-H5_REGULAR="${H5_REGULAR:-/data/shared/dongfang_syn_reg/h5_sw06/sw06_label.h5}"
-H5_MASK="${H5_MASK:-/data/shared/dongfang_syn_reg/h5_sw06/sw06_mask.h5}"
-MASK_SEGY="${MASK_SEGY:-/data/shared/dongfang_syn_reg/mask_miss30pct_004-sw06-Sj5-label.sgy}"
+CHECKPOINT="${CHECKPOINT:-/home/chengzhitong/5d_regular/seismic_flow/ckp/model-18.pth}"
+H5_REGULAR="${H5_REGULAR:-/data/shared/dongfang_syn_reg/h5_block/sw06_label.h5}"
+H5_MASK="${H5_MASK:-/data/shared/dongfang_syn_reg/h5_block/sw06_mask.h5}"
+MASK_SEGY="${MASK_SEGY:-/data/shared/dongfang_syn_reg/004-sw06-Sj5-label-mask.sgy}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/gen_fill_results_sw}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/gen_fill_results_sw_block}"
 OUTPUT_SEGY="${OUTPUT_SEGY:-${OUTPUT_DIR}/filled_missing.sgy}"
 OUTPUT_RESIDUAL_SEGY="${OUTPUT_RESIDUAL_SEGY:-${OUTPUT_DIR}/residual.sgy}"
-LABEL_SEGY="${LABEL_SEGY:-/data/shared/dongfang_syn_reg/004-sw06-Sj5-label.sgy}"  # ground truth SEGY for residual computation (optional)
+LABEL_SEGY="${LABEL_SEGY:-/data/shared/dongfang_syn_reg/004-sw06-Sj5-label-label.sgy}"  # ground truth SEGY for residual computation (optional)
 
 SEGY_PROFILE="${SEGY_PROFILE:-sw06}"
 
 NUM_WORKERS="${NUM_WORKERS:-4}"
-INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-1}"  # patches per forward pass
+INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-24}"  # patches per forward pass
 TRACE_PS="${TRACE_PS:-224}"  # patch trace count (must match training)
 OVERLAP_RATIO="${OVERLAP_RATIO:-0.5}"  # sliding window overlap (0.5 = 50% overlap, equal-weight averaging)
 TIME_PS="${TIME_PS:-2048}"
@@ -60,8 +60,8 @@ VIS_BATCHES="${VIS_BATCHES:-0}"
 SORT_OUTPUT="${SORT_OUTPUT:-true}"  # sort output traces by profile.sort_keys
 
 # Periodic backfill and header mode
-BACKFILL_INTERVAL="${BACKFILL_INTERVAL:-0}"  # partial SEGY write every N batches (0 = only at end)
-HEADER_MODE="${HEADER_MODE:-}"  # fixed | self_computed (default from profile)
+BACKFILL_INTERVAL="${BACKFILL_INTERVAL:-1}"  # partial SEGY write every N batches (0 = only at end)
+HEADER_MODE="${HEADER_MODE:-fixed}"  # fixed | self_computed (default from profile)
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -114,7 +114,7 @@ fi
 
 # Build launch command
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
-  LAUNCHER=(torchrun --nproc_per_node="${NPROC_PER_NODE}")
+  LAUNCHER=(torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port 29504)
 else
   LAUNCHER=("${PYTHON_BIN}")
   cmd+=(--device "${DEVICE}")

@@ -34,6 +34,7 @@ class WeightType(enum.Enum):
     NONE = enum.auto()
     VELOCITY = enum.auto()
     LIKELIHOOD = enum.auto()
+    LOGITNORMAL = enum.auto()
 
 
 class Transport:
@@ -108,8 +109,12 @@ class Transport:
         
         x0 = th.randn_like(x1)
         t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
-        t = th.rand((x1.shape[0],)) * (t1 - t0) + t0
-        t = t.to(x1)
+        if self.loss_type == WeightType.LOGITNORMAL:
+            t = th.randn((x1.shape[0],), device=x1.device).sigmoid()
+            t = t * (t1 - t0) + t0
+        else:
+            t = th.rand((x1.shape[0],)) * (t1 - t0) + t0
+            t = t.to(x1)
         return t, x0, x1
     
 
@@ -136,8 +141,13 @@ class Transport:
 
         terms = {}
         terms['pred'] = model_output
+        terms['ut'] = ut
         if self.model_type == ModelType.VELOCITY:
-            terms['loss'] = mean_flat(((model_output - ut) ** 2))
+            if self.loss_type == WeightType.LOGITNORMAL:
+                weight = path.expand_t_like_x(t, xt) * (1.0 - path.expand_t_like_x(t, xt)) + 1e-4
+                terms['loss'] = mean_flat(weight.detach() * ((model_output - ut) ** 2))
+            else:
+                terms['loss'] = mean_flat(((model_output - ut) ** 2))
         else: 
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))

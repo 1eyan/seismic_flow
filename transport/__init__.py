@@ -30,6 +30,8 @@ def create_transport(
         loss_type = WeightType.VELOCITY
     elif loss_weight == "likelihood":
         loss_type = WeightType.LIKELIHOOD
+    elif loss_weight == "logitnormal":
+        loss_type = WeightType.LOGITNORMAL
     else:
         loss_type = WeightType.NONE
 
