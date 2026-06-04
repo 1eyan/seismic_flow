@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from inspect import isfunction
 from .rope import SegmentedRoPEExpCached
+from .fourier_enoder import Seismic5DEncoder
 
 def exists(val):
     return val is not None
@@ -149,7 +150,7 @@ class RMSNorm(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight * hidden_states).to(input_dtype)
+        return (self.weight * hidden_states + self.shift).to(input_dtype)
 
 class MYact(nn.Module):
     def __init__(self):
@@ -250,43 +251,43 @@ class Resblock(nn.Module):
         in_channels: int,
         out_channels: int,
         time_channels: int,
-        dropout: float = 0.1,
+        dropout: float = 0.05,
+        kernel_size=(1, 7),
+        norm_type: str = "instance",
     ):
         super().__init__()
-        # 确保groups数量合适
-        #print(self.n_groups,in_channels)
-        # 第一层
-        self.norm1 = GroupNorm(
-            num_channels=in_channels,
-        )
+        trace_pad = kernel_size[0] // 2
+        time_pad = kernel_size[1] // 2
+
+        if norm_type == "instance":
+            self.norm1 = nn.InstanceNorm2d(in_channels, affine=True)
+            self.norm2 = nn.InstanceNorm2d(out_channels, affine=True)
+        else:
+            self.norm1 = GroupNorm(num_channels=in_channels)
+            self.norm2 = GroupNorm(num_channels=out_channels)
+
         self.act1 = MYact()
         self.conv1 = torch.nn.Conv2d(
             in_channels=in_channels,
             out_channels=out_channels,
-            kernel_size=(1,3),
-            padding=(0,1),
+            kernel_size=kernel_size,
+            padding=(trace_pad, time_pad),
         )
         
-        # 第二层
-        self.norm2 = GroupNorm(
-            num_channels=out_channels,
-        )
         self.act2 = MYact()
         self.conv2 = torch.nn.Conv2d(
             in_channels=out_channels,
             out_channels=out_channels,
-            kernel_size=(1,3),
-            padding=(0,1),
+            kernel_size=kernel_size,
+            padding=(trace_pad, time_pad),
         )
         
-        # 残差连接
         if in_channels != out_channels:
-            self.shortcut = torch.nn.Conv2d(in_channels, out_channels,kernel_size=1,padding=0)
+            self.shortcut = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0)
         else:
             self.shortcut = torch.nn.Identity()
             
-        # 时间编码
-        self.adaLN=AdaTimeModulation(time_dim=time_channels,hidden_dim=out_channels)
+        self.adaLN = AdaTimeModulation(time_dim=time_channels, hidden_dim=out_channels)
         self.time_emb = torch.nn.Linear(time_channels, out_channels)
         self.time_act = MYact()
         self.dropout = torch.nn.Dropout(dropout)
@@ -388,329 +389,7 @@ class Upsample(nn.Module):
         return self.conv_list[self.i](x)
 
 
-class RelativePositionBias(nn.Module):
-    def __init__(self, window_size, num_heads):
-        super().__init__()
-        self.window_size = window_size  # 窗口大小 (D_win, T_win)，用于构建相对位置索引
-        self.num_heads = num_heads
-        self.rel_pos_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
-        )
-        self.register_buffer("relative_position_index", self.get_position_index())
-
-    def get_position_index(self):
-        coords_d = torch.arange(self.window_size[0])
-        coords_t = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_d, coords_t], indexing="ij"))
-        coords_flatten = coords.flatten(1)
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
-        relative_coords[:, :, 0] += self.window_size[0] - 1
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * self.window_size[1]  - 1
-        relative_position_index = relative_coords.sum(-1)
-        return relative_position_index
-
-    def forward(self):
-        return self.rel_pos_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1],
-            self.window_size[0] * self.window_size[1],
-            -1
-        ).permute(2, 0, 1)
-
-
-class WindowAttention2D(nn.Module):
-    #window_size=(15,8), num_heads=8, shift_size=(5,4),
-    ##window_size=(9,8), num_heads=8, shift_size=(3,4),
-    #window_size=(17,8), num_heads=8, shift_size=(8,4)
-    #def __init__(self, dim, window_size=(16,8), shift_size=(8,4), num_heads=8, attn_drop=0.1, proj_drop=0.1)
-    def __init__(
-        self, 
-        dim, 
-        window_size=(32,1248//8), 
-        shift_size=(16,0), 
-        num_heads=8, 
-        attn_drop=0.1, 
-        proj_drop=0.1,
-        qk_norm=False,
-        *,
-        use_rope: bool = True,
-        rope_n_pos: int = 4,
-        rope_min_log: float = -12,
-        rope_max_log: float = 0,
-        rope_mapper: str = "linear",
-        rope_hidden: int = 128,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.num_heads = num_heads
-        assert dim % num_heads == 0, "dim must be divisible by num_heads"
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-        self.pos_bias = RelativePositionBias(window_size, num_heads)
-        self.last_score_map = None
-        
-        # RoPE 相关参数（与 TraceAxisAttention2D 保持一致）
-        self.use_rope = bool(use_rope)
-        self.rope_dim = None
-        self.rope = None
-        if qk_norm:
-            self.q_norm = RMSNorm(self.head_dim)
-            self.k_norm = RMSNorm(self.head_dim)
-        else:
-            self.q_norm = None
-            self.k_norm = None
-        if self.use_rope:
-            _rope_dim = self.head_dim 
-            _rope_dim = (_rope_dim // 2) * 2  
-            if _rope_dim < 2:
-                self.use_rope = False
-            else:
-                self.rope_dim = _rope_dim
-                self.rope = SegmentedRoPEExpCached(
-                    D=self.rope_dim * self.num_heads,
-                    N=self.num_heads,
-                    n_pos=int(rope_n_pos),
-                    min_log=float(rope_min_log),
-                    max_log=float(rope_max_log),
-                    mapper=str(rope_mapper),
-                    hidden=int(rope_hidden),
-                )
-
-    @staticmethod
-    def _default_trace_pos(B, H, device):
-        """
-        默认 trace 位置: 归一化到 [0,1] 的索引，shape = [B, H, 1]
-        用 float32 生成，后续在 RoPE 内部按 out_dtype 再转换
-        """
-        if H <= 1:
-            pos_1d = torch.zeros((1,), device=device, dtype=torch.float32)
-        else:
-            pos_1d = torch.linspace(0.0, 1.0, steps=H, device=device, dtype=torch.float32)
-        return pos_1d.view(1, H, 1).expand(B, H, 1)
-
-    ##2d attention mask
-    def create_attn_mask(self, B, D, T, win_h, win_w, shift_h, shift_w, device):
-        # 无 shift -> 不需要 mask
-        if shift_h == 0 and shift_w == 0:
-            return None
-
-        # 要求 shift < window（Swin 的约束），若不满足则取模
-        if not (0 < shift_h < win_h):
-            shift_h = shift_h % win_h
-        if not (0 < shift_w < win_w):
-            shift_w = shift_w % win_w
-
-        num_win_h = D // win_h
-        num_win_w = T // win_w
-        assert D % win_h == 0 and T % win_w == 0, "D/T must be divisible by window size"
-
-        # img_mask: [D, T], 每个像素标记其所属 region id（3x3 区域分配）
-        img_mask = torch.zeros((D, T), device=device, dtype=torch.long)
-
-        cnt = 0
-        # 和 Swin 一致的三段切分（左/中/右或上/中/下）
-        h_slices = (slice(0, -win_h), slice(-win_h, -shift_h), slice(-shift_h, None))
-        w_slices = (slice(0, -win_w), slice(-win_w, -shift_w), slice(-shift_w, None))
-
-        for h in h_slices:
-            for w in w_slices:
-                img_mask[h, w] = cnt
-                cnt += 1
-
-        # 分窗并得到窗口 id 序列
-        mask_windows = img_mask.view(num_win_h, win_h, num_win_w, win_w).permute(0, 2, 1, 3).reshape(-1, win_h * win_w)
-        # mask_windows: [num_windows, N]
-        # attn_mask_bool: [num_windows, N, N] True 表示不同 region -> 需屏蔽
-        attn_mask_bool = (mask_windows.unsqueeze(1) != mask_windows.unsqueeze(2))  # [num_windows, N, N]
-        # 扩展到 heads dim 前的 shape: [num_windows, 1, N, N]
-        attn_mask = attn_mask_bool.unsqueeze(1).to(torch.bool)  # bool
-        # 扩展到 batch：B * num_windows
-        attn_mask = attn_mask.repeat(B, 1, 1, 1)  # [B * num_windows, 1, N, N]
-        return attn_mask
-    
-    def create_trace_keep_mask(self, B, D, T,win_h, win_w, shift_h, num_win_h, num_win_w, device):
-        """
-        1d trace attention mask
-        仅仅计算地震道之间的相关性
-        返回 bool mask：True=允许注意力，False=屏蔽
-        形状对齐 trace-axis 注意力：最终会扩展到 [B*num_windows*win_w, win_h, win_h]
-        """
-        if shift_h == 0:
-            return None
-
-        # 1D Swin-style 三段切分，只在 D 维
-        if not (0 < shift_h < win_h):
-            shift_h = shift_h % win_h
-
-        img_mask = torch.zeros((D,), device=device, dtype=torch.long)
-        cnt = 0
-        h_slices = (slice(0, -win_h), slice(-win_h, -shift_h), slice(-shift_h, None))
-        for h in h_slices:
-            img_mask[h] = cnt
-            cnt += 1
-
-        # 每个 D-window 的 region id: [num_win_h, win_h]
-        mask_windows_d = img_mask.view(num_win_h, win_h)
-
-        # 扩展到所有 T-window： [num_win_h*num_win_w, win_h]
-        mask_windows = mask_windows_d[:, None, :].expand(num_win_h, num_win_w, win_h).reshape(num_win_h * num_win_w, win_h)
-
-        # keep mask: 同 region 才允许注意力 -> True allowed
-        keep = (mask_windows.unsqueeze(1) == mask_windows.unsqueeze(2))  # [num_win_h*num_win_w, win_h, win_h]
-
-        # 扩到 batch： [B*num_windows, win_h, win_h]
-        keep = keep.unsqueeze(0).expand(B, -1, -1, -1).reshape(B * num_win_h * num_win_w, win_h, win_h)
-
-        # 你的注意力是对每个窗口的每个 time 列单独算，所以再 repeat_interleave(win_w)
-        keep = keep.repeat_interleave(win_w, dim=0)  # [B*num_windows*win_w, win_h, win_h]
-        return keep
-
-    def forward(self, x, pos=None):
-        """
-        x: [B, D, T, C]
-        pos(可选): [B, D, rope_n_pos] 或 [B, D, 4]，对应每个 D 位置的位置编码
-        returns: same shape
-        """
-        B, D, T, C = x.shape
-        win_h, win_w = self.window_size
-        shift_h, shift_w = self.shift_size
-        shift_w = 0 
-        # basic checks
-        assert D % win_h == 0 and T % win_w == 0, f"D/T must be divisible by window size: got D={D},T={T},win_h={win_h},win_w={win_w}"
-        if shift_h >= win_h or shift_w >= win_w:
-            shift_h = shift_h % win_h
-            shift_w = shift_w % win_w
-
-        num_win_h = D // win_h
-        num_win_w = T // win_w
-        num_windows = B * num_win_h * num_win_w
-        N = win_h * win_w
-        
-        x_shifted = x
-        pos_shifted = pos
-        if shift_h > 0 or shift_w > 0:
-            x_shifted = torch.roll(x, shifts=(-shift_h, -shift_w), dims=(1, 2))
-            if pos is not None:
-                pos_shifted = torch.roll(pos, shifts=(-shift_h,), dims=(1,))
-
-        x_windows = x_shifted.view(B, num_win_h, win_h, num_win_w, win_w, C)
-        x_windows = x_windows.permute(0, 1, 3, 2, 4, 5).reshape(B * num_win_h * num_win_w, win_h, win_w, C)  # [B*num_windows, win_h, win_w, C]
-
-        pos_windows = None
-        if pos_shifted is not None:
-            P = pos_shifted.shape[-1]
-            pos_windows = pos_shifted.reshape(B, num_win_h, win_h, P)
-            pos_windows = pos_windows[:, :, None, :, :].expand(B, num_win_h, num_win_w, win_h, P)
-            pos_windows = pos_windows.reshape(B * num_win_h * num_win_w, win_h, P)
-
-        x_windows_reshaped = x_windows.permute(0, 2, 1, 3).contiguous()  # [B*num_windows, win_w, win_h, C]
-        x_windows_reshaped = x_windows_reshaped.view(B * num_win_h * num_win_w * win_w, win_h, C)  # [B*num_windows*win_w, win_h, C]
-        
-        qkv = self.qkv(x_windows_reshaped)  # [B*num_windows*win_w, win_h, 3*C]
-        qkv = qkv.view(B * num_win_h * num_win_w * win_w, win_h, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B*num_windows*win_w, num_heads, win_h, head_dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each: [B*num_windows*win_w, num_heads, win_h, head_dim]
-        
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-        if self.k_norm is not None:
-            k = self.k_norm(k)
-    
-        if self.use_rope and self.rope is not None and self.rope_dim is not None:
-            num_windows = B * num_win_h * num_win_w
-            if pos_windows is not None:
-                pos_in = pos_windows  # [B*num_windows, win_h, rope_n_pos]
-            else:
-                pos_in = self._default_trace_pos(num_windows, win_h, device=x.device)  # [B*num_windows, win_h, 1]
-            
-            # 计算 cos/sin，shape: [B*num_windows, heads, win_h, half]
-            self.rope.precompute_cos_sin(pos_in, out_dtype=q.dtype, device=q.device)
-            cos = self.rope.cos  # [B*num_windows, heads, win_h, half]
-            sin = self.rope.sin  # [B*num_windows, heads, win_h, half]
-
-            rope_dim = self.rope_dim
-            half = rope_dim // 2
-
-            q = q.contiguous().view(B * num_win_h * num_win_w, win_w, self.num_heads, win_h, self.head_dim)
-            k = k.contiguous().view(B * num_win_h * num_win_w, win_w, self.num_heads, win_h, self.head_dim)
-
-            q_tail = q[..., rope_dim:]
-            k_tail = k[..., rope_dim:]
-
-            q_rot = q[..., :rope_dim].contiguous().view(B * num_win_h * num_win_w, win_w, self.num_heads, win_h, half, 2)
-            k_rot = k[..., :rope_dim].contiguous().view(B * num_win_h * num_win_w, win_w, self.num_heads, win_h, half, 2)
-
-            q_even, q_odd = q_rot[..., 0], q_rot[..., 1]  # [B*num_windows, win_w, heads, win_h, half]
-            k_even, k_odd = k_rot[..., 0], k_rot[..., 1]
-
-            cos_ = cos.unsqueeze(1)  # [B*num_windows, 1, heads, win_h, half]
-            sin_ = sin.unsqueeze(1)  # [B*num_windows, 1, heads, win_h, half]
-
-            q_even2 = q_even * cos_ - q_odd * sin_
-            q_odd2 = q_even * sin_ + q_odd * cos_
-            k_even2 = k_even * cos_ - k_odd * sin_
-            k_odd2 = k_even * sin_ + k_odd * cos_
-
-            q_rot2 = torch.stack([q_even2, q_odd2], dim=-1).view(B * num_win_h * num_win_w, win_w, self.num_heads, win_h, rope_dim)
-            k_rot2 = torch.stack([k_even2, k_odd2], dim=-1).view(B * num_win_h * num_win_w, win_w, self.num_heads, win_h, rope_dim)
-
-            q = torch.cat([q_rot2, q_tail], dim=-1).view(B * num_win_h * num_win_w * win_w, self.num_heads, win_h, self.head_dim).contiguous()
-            k = torch.cat([k_rot2, k_tail], dim=-1).view(B * num_win_h * num_win_w * win_w, self.num_heads, win_h, self.head_dim).contiguous()
-       
-        attn_mask = None
-        if shift_h > 0:
-            keep_mask = self.create_trace_keep_mask(
-                B=B, D=D, T=T,
-                win_h=win_h, win_w=win_w,
-                shift_h=shift_h,
-                num_win_h=num_win_h, num_win_w=num_win_w,
-                device=x.device
-            )  # keep_mask: [B*, L, L], True=允许
-            attn_mask = (~keep_mask).unsqueeze(1).to(torch.bool).contiguous()  # [B*,1,L,L], True=屏蔽
-
-        if hasattr(F, "scaled_dot_product_attention") and torch.__version__ >= "2.0.0":
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,  
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                is_causal=False
-            )
-        else:
-            attn = (q @ k.transpose(-2, -1)) * self.scale  # [B*,heads,L,L]
-            if attn_mask is not None:
-                attn = attn.masked_fill(attn_mask, float("-inf"))
-            attn = F.softmax(attn, dim=-1)
-            attn = self.attn_drop(attn)
-            attn_output = attn @ v
-        
-        # [B*num_windows*win_w, num_heads, win_h, head_dim] -> [B*num_windows*win_w, win_h, C]
-        attn_output = attn_output.transpose(1, 2).contiguous()  # [B*num_windows*win_w, win_h, num_heads, head_dim]
-        attn_output = attn_output.view(B * num_win_h * num_win_w * win_w, win_h, C)  # [B*num_windows*win_w, win_h, C]
-        
-        out = self.proj(attn_output)  # [B*num_windows*win_w, win_h, C]
-        out = self.proj_drop(out)
-        
-        out = out.view(B * num_win_h * num_win_w, win_w, win_h, C)  # [B*num_windows, win_w, win_h, C]
-        out = out.permute(0, 2, 1, 3).contiguous()  # [B*num_windows, win_h, win_w, C]
-        out = out.view(B, num_win_h, num_win_w, win_h, win_w, C)
-        out = out.permute(0, 1, 3, 2, 4, 5).reshape(B, D, T, C)
-
-        if shift_h > 0 or shift_w > 0:
-            out = torch.roll(out, shifts=(shift_h, shift_w), dims=(1, 2))
-
-        return out
-
-
-# ========== 新增：Trace-axis global attention ==========
+# ========== Trace-axis global attention ==========
 class TraceAxisAttention2D(nn.Module):
     """
     Trace-axis global attention: 对每个时间位置 w，在 H 维度上做全局多头自注意力。
@@ -1085,67 +764,241 @@ class TraceAxisAttention2D_gate(nn.Module):
         out = out.permute(0, 2, 1, 3).contiguous()  # [B, H, W, C]
         return out
 
-class DiTBlock_windows(nn.Module):
+
+# ========== Time-axis windowed attention ==========
+class TimeAxisAttention1D(nn.Module):
     """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    沿时间轴（W维）做窗口多头自注意力，每个道位置 h 独立。
+    使用 RoPE 编码归一化时间位置 [0,1]。
+    输入: x: [B, H, W, C]
+    输出: [B, H, W, C]
     """
-    def __init__(self, hidden_size, num_heads,mlp_ratio=4.0,):
+    def __init__(
+        self,
+        dim,
+        window_size=64,
+        shift_size=32,
+        num_heads=8,
+        attn_drop=0.0,
+        proj_drop=0.1,
+        qk_norm=True,
+        *,
+        use_rope: bool = True,
+        rope_n_pos: int = 1,
+        rope_min_log: float = -12,
+        rope_max_log: float = 0,
+        rope_mapper: str = "linear",
+        rope_hidden: int = 128,
+    ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = WindowAttention2D(dim=hidden_size,num_heads=num_heads)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        #self.time_emb=nn.Linear(time_dim,hidden_size)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
-    def forward(self, x,c,rope_pos=None):
-        #print(c.shape)
-        #print(x.shape)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        #print(shift_msa.shape,scale_msa.shape,gate_msa.shape,shift_mlp.shape,scale_mlp.shape,gate_mlp.shape)
-        x1=modulate(self.norm1(x), shift_msa.unsqueeze(-2),scale_msa.unsqueeze(-2))
-        x = x + gate_msa.unsqueeze(-2)* self.attn(x1,pos=rope_pos)
-        x = x + gate_mlp.unsqueeze(-2) * self.mlp(modulate(self.norm2(x), shift_mlp.unsqueeze(-2), scale_mlp.unsqueeze(-2)))
-        return x
+        self.dim = dim
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.num_heads = num_heads
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
+        self.use_rope = bool(use_rope)
+        self.rope_dim = None
+        self.rope = None
+        if self.use_rope:
+            _rope_dim = self.head_dim
+            _rope_dim = (_rope_dim // 2) * 2
+            if _rope_dim < 2:
+                self.use_rope = False
+            else:
+                self.rope_dim = _rope_dim
+                self.rope = SegmentedRoPEExpCached(
+                    D=self.rope_dim * self.num_heads,
+                    N=self.num_heads,
+                    n_pos=int(rope_n_pos),
+                    min_log=float(rope_min_log),
+                    max_log=float(rope_max_log),
+                    mapper=str(rope_mapper),
+                    hidden=int(rope_hidden),
+                )
+
+    @staticmethod
+    def _default_time_pos(B, W, device):
+        if W <= 1:
+            pos_1d = torch.zeros((1,), device=device, dtype=torch.float32)
+        else:
+            pos_1d = torch.linspace(0.0, 1.0, steps=W, device=device, dtype=torch.float32)
+        return pos_1d.view(1, W, 1).expand(B, W, 1)
+
+    def _create_shift_mask(self, B, H, W, win, shift, num_win, device):
+        if shift == 0:
+            return None
+        if not (0 < shift < win):
+            shift = shift % win
+        img_mask = torch.zeros((W,), device=device, dtype=torch.long)
+        cnt = 0
+        slices = (slice(0, -win), slice(-win, -shift), slice(-shift, None))
+        for s in slices:
+            img_mask[s] = cnt
+            cnt += 1
+        mask_win = img_mask.view(num_win, win)
+        mask_win = mask_win[:, None, :].expand(num_win, H, win).reshape(num_win * H, win)
+        keep = (mask_win.unsqueeze(1) == mask_win.unsqueeze(2))
+        keep = keep.unsqueeze(0).expand(B, -1, -1, -1).reshape(B * num_win * H, win, win)
+        attn_mask = (~keep).unsqueeze(1).to(torch.bool).contiguous()
+        return attn_mask
+
+    def forward(self, x, pos=None):
+        B, H, W, C = x.shape
+        win = self.window_size
+        shift = self.shift_size
+        if W < win:
+            win = W
+            shift = 0
+        elif W % win != 0:
+            for d in range(win, 1, -1):
+                if W % d == 0:
+                    win = d
+                    break
+            shift = shift if shift < win else win // 2
+        assert W % win == 0, f"W must be divisible by win: W={W}, win={win}"
+
+        num_win = W // win
+        total_win = B * num_win * H
+
+        x_shifted = x
+        pos_shifted = pos
+        if shift > 0:
+            x_shifted = torch.roll(x, shifts=(-shift,), dims=(2,))
+            if pos is not None:
+                pos_shifted = torch.roll(pos, shifts=(-shift,), dims=(2,))
+
+        x_windows = x_shifted.view(B, H, num_win, win, C)
+        x_windows = x_windows.permute(0, 2, 1, 3, 4).reshape(total_win, win, C)
+
+        qkv = self.qkv(x_windows)
+        qkv = qkv.view(total_win, win, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4).contiguous()
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+        if self.k_norm is not None:
+            k = self.k_norm(k)
+
+        if self.use_rope and self.rope is not None and self.rope_dim is not None:
+            if pos_shifted is not None:
+                pos_in = pos_shifted
+                if pos_in.dim() == 3:
+                    pos_in = pos_in.reshape(B, H, num_win, win, -1)
+                    pos_in = pos_in.permute(0, 2, 1, 3, 4).reshape(total_win, win, -1)
+                elif pos_in.dim() == 4:
+                    pos_in = pos_in.permute(0, 2, 1, 3).reshape(total_win, win)
+                    pos_in = pos_in.unsqueeze(-1)
+            else:
+                pos_in = self._default_time_pos(total_win, win, device=x.device)
+
+            self.rope.precompute_cos_sin(pos_in, out_dtype=q.dtype, device=q.device)
+            cos = self.rope.cos
+            sin = self.rope.sin
+
+            rope_dim = self.rope_dim
+            half = rope_dim // 2
+
+            q_tail = q[..., rope_dim:]
+            k_tail = k[..., rope_dim:]
+
+            q_rot = q[..., :rope_dim].contiguous().view(total_win, self.num_heads, win, half, 2)
+            k_rot = k[..., :rope_dim].contiguous().view(total_win, self.num_heads, win, half, 2)
+
+            q_even, q_odd = q_rot[..., 0], q_rot[..., 1]
+            k_even, k_odd = k_rot[..., 0], k_rot[..., 1]
+
+            cos_ = cos
+            sin_ = sin
+
+            q_even2 = q_even * cos_ - q_odd * sin_
+            q_odd2 = q_even * sin_ + q_odd * cos_
+            k_even2 = k_even * cos_ - k_odd * sin_
+            k_odd2 = k_even * sin_ + k_odd * cos_
+
+            q_rot2 = torch.stack([q_even2, q_odd2], dim=-1).view(total_win, self.num_heads, win, rope_dim)
+            k_rot2 = torch.stack([k_even2, k_odd2], dim=-1).view(total_win, self.num_heads, win, rope_dim)
+
+            q = torch.cat([q_rot2, q_tail], dim=-1).contiguous()
+            k = torch.cat([k_rot2, k_tail], dim=-1).contiguous()
+
+        attn_mask = self._create_shift_mask(B, H, W, win, shift, num_win, device=x.device)
+
+        if hasattr(F, 'scaled_dot_product_attention') and torch.__version__ >= '2.0.0':
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                is_causal=False
+            )
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            if attn_mask is not None:
+                attn = attn.masked_fill(attn_mask, float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_drop(attn)
+            attn_output = attn @ v
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(total_win, win, C)
+        out = self.proj(attn_output)
+        out = self.proj_drop(out)
+
+        out = out.view(B, num_win, H, win, C)
+        out = out.permute(0, 2, 1, 3, 4).reshape(B, H, W, C)
+
+        if shift > 0:
+            out = torch.roll(out, shifts=(shift,), dims=(2,))
+
+        return out
 
 
-# ========== 新增：使用 Trace-axis attention 的 DiTBlock ==========
-class DiTBlockTrace_noRoPE(nn.Module):
+class DiTBlockTime(nn.Module):
     """
-    DiT block with Trace-axis global attention instead of WindowAttention2D.
+    DiT block with time-axis windowed attention instead of trace-axis attention.
     保持 adaLN-Zero conditioning 逻辑不变。
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, time_window_size=64, time_shift_size=32):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = TraceAxisAttention2D(dim=hidden_size, num_heads=num_heads)
+        self.attn = TimeAxisAttention1D(
+            dim=hidden_size,
+            num_heads=num_heads,
+            window_size=time_window_size,
+            shift_size=time_shift_size,
+        )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0.1)
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0.0)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
-    
-    def forward(self, x, c):
-        """
-        x: [B, H, W, C]
-        c: [B, H, C] (fourier_emb)
-        """
+
+    def forward(self, x, c, rope_pos=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         x1 = modulate(self.norm1(x), shift_msa.unsqueeze(-2), scale_msa.unsqueeze(-2))
-        x = x + gate_msa.unsqueeze(-2) * self.attn(x1)
+        x = x + gate_msa.unsqueeze(-2) * self.attn(x1, pos=None)
         x = x + gate_mlp.unsqueeze(-2) * self.mlp(modulate(self.norm2(x), shift_mlp.unsqueeze(-2), scale_mlp.unsqueeze(-2)))
         return x
+
 
 class DiTBlockTrace(nn.Module):
     """
@@ -1160,7 +1013,7 @@ class DiTBlockTrace(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0.1)
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0.0)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -1179,220 +1032,6 @@ class DiTBlockTrace(nn.Module):
         x = x + gate_msa.unsqueeze(-2) * self.attn(x1, pos=rope_pos)
         x = x + gate_mlp.unsqueeze(-2) * self.mlp(modulate(self.norm2(x), shift_mlp.unsqueeze(-2), scale_mlp.unsqueeze(-2)))
         return x
-
-class DiTBlockTrace_gate(nn.Module):
-    """
-    DiT block with Trace-axis global attention instead of WindowAttention2D.
-    保持 adaLN-Zero conditioning 逻辑不变。
-    支持通过 rope_pos 参数传递位置信息给 RoPE。
-    """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = TraceAxisAttention2D_gate(dim=hidden_size, num_heads=num_heads)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0.1)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
-    
-    def forward(self, x, c, rope_pos=None):
-        """
-        x: [B, H, W, C]
-        c: [B, H, C] (fourier_emb)
-        rope_pos: 可选，[B, H] 或 [B, H, n_pos]，用于 RoPE 的位置编码
-        """
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x1 = modulate(self.norm1(x), shift_msa.unsqueeze(-2), scale_msa.unsqueeze(-2))
-        x = x + gate_msa.unsqueeze(-2) * self.attn(x1, pos=rope_pos)
-        x = x + gate_mlp.unsqueeze(-2) * self.mlp(modulate(self.norm2(x), shift_mlp.unsqueeze(-2), scale_mlp.unsqueeze(-2)))
-        return x
-
-class DiTBlockNoCond(nn.Module):
-    """
-    与 DiTBlock 结构保持一致，但不使用任何条件
-    从而使中间 attention/MLP 模块完全不受位置/条件控制。
-    """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0,):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = WindowAttention2D(dim=hidden_size, num_heads=num_heads)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-
-    def forward(self, x, c=None):
-        # 忽略 c
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-'''class SeisDiT(torch.nn.Module):
-    ##adaLN-zero
-    def __init__(
-        self,
-        image_channels,
-        n_channels=64,
-        channel=[1,2,2,4],
-        d_model=512,
-        nhead=4,
-        dropout=0.1,
-        num_layers=12,
-        output_channels=1,
-        res_blocks=1,
-        strides=[2,2,2,1],
-        f_dict=None,
-        pe_type='transformer',      
-        #label_dim=5
-    ):
-        super(SeisDiT, self).__init__()
-        # alpha = (2*num_layers)**0.25
-        # beta =  (8*num_layers)**(-0.25)
-        self.image_channels = image_channels
-        self.n_channels= n_channels
-        self.channel = channel
-        n_res=len(channel)
-        self.d_model = d_model
-        self.nhead = nhead
-        self.dropout = dropout
-        self.num_layers = num_layers
-
-        self.tokenizer = torch.nn.Conv2d(
-            1, n_channels//2, kernel_size=(1, 1), padding=(0, 0),bias=True
-        )
-        self.tokenizer_cond = torch.nn.Conv2d(
-            1, n_channels//2, kernel_size=(1, 1), padding=(0, 0),bias=True
-        )
-        self.mask_adapter_n=torch.nn.Conv2d(
-            n_channels, n_channels, kernel_size=(1, 1), padding=(0, 0),bias=True
-        )
-        self.mask_adapter_d = torch.nn.Conv2d(
-            d_model, d_model, kernel_size=(1, 1), padding=(0, 0),bias=True
-        )
-
-        self.time_emb = TimeEmbedding(d_model)
-        self.fourier_encoder=fourier_enoder.Seismic5DEncoder(coord_dim=4,max_freq=128,out_dim=d_model,num_bands=32,pe_type = pe_type)
-        last_channel = n_channels*channel[-1]*channel[-2]*channel[-3]
-
-        self.to_attn = torch.nn.Conv2d(last_channel, d_model, kernel_size=(1,1), stride=(1,1), padding=(0,0), bias=True)
-        self.to_unet = torch.nn.Conv2d(d_model, last_channel, kernel_size=(1,1), stride=(1,1), padding=(0,0), bias=True)
-        attenL =[]
-        for i in range(num_layers):
-            attenL.append(DiTBlockTrace(hidden_size=d_model,num_heads=nhead))
-            # attenL.append(Attention_Block(d_model=d_model))
-        self.attenL = torch.nn.ModuleList(attenL)
-        self.norm_final = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(d_model, 2 * d_model, bias=True)
-        )
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
-        down = []  
-        out_channels = in_channels = n_channels
-        for i in range(n_res):
-            out_channels = in_channels * channel[i]
-            for _ in range(res_blocks): 
-                # print(out_channels,in_channels)
-                down.append(
-                    Resblock(in_channels, out_channels, d_model,)
-                )
-                in_channels = out_channels
-            if i < n_res - 1:  
-                down.append(Downsample(in_channels,i,strides[i]))
-
-        self.down = torch.nn.ModuleList(down)
-        up = []
-        in_channels = out_channels  
-        for i in reversed(range(n_res)):
-            out_channels = in_channels
-            for _ in range(res_blocks):
-                up.append(
-                    Resblock(in_channels+out_channels, out_channels,d_model,)
-                )
-            out_channels = in_channels // channel[i]
-            up.append(
-                Resblock(in_channels+out_channels, out_channels,d_model,)
-            )  
-            in_channels = out_channels
-            if i > 0:
-                up.append(Upsample(in_channels, i - 1,strides[i-1]))
-        self.up = torch.nn.ModuleList(up)
-        self.ac=MYact()
-        self.norm = torch.nn.GroupNorm(16,in_channels,eps=1e-5)
-        self.final = torch.nn.Conv2d(
-            in_channels, output_channels, kernel_size=(1, 5), padding=(0, 2),stride=(1,1),bias=True
-        )
-        self.A=torch.nn.Conv2d(in_channels,output_channels,kernel_size=(1,5),stride=(1,1),padding=(0,2),bias=True)
-        nn.init.zeros_(self.A.weight)
-        nn.init.zeros_(self.A.bias)
-        nn.init.zeros_(self.final.weight)
-        nn.init.zeros_(self.final.bias)
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor,condL=None,log_tau=None,time_axis=None,training=False):
-        B,_,_,T = x.shape  
-        x_in,x_cond = x[:,0:1],x[:,1:2] 
-        mask = torch.all(x_cond == 0, dim=-1, keepdim=True).to(x_cond.dtype)  # (B,1,H,1)
-        mask = mask.expand(-1, -1, -1, 1)
-        STD=x_cond.std(dim=(2,3),keepdim=True)+1e-2
-        a = (x_cond.std(-1,keepdim=True)+STD*0.05)*(1-mask)+mask*STD
-        x_cond/=a
-        x_in/=a
-        x_cond = self.tokenizer_cond(x_cond)
-        x_in=self.tokenizer(x_in)
-        x=torch.cat([x_in,x_cond],dim=1)
-        x= (1-mask)*x+mask*self.mask_adapter_n(x)
-
-        t = self.time_emb(t)
-        h = [x]
-        for m in self.down:
-            x = m(x, t)
-            h.append(x)      
-        x=self.to_attn(x)
-        x = (1-mask)*x+mask*self.mask_adapter_d(x) 
-        B,D,H,W=x.shape
-        fourier_emb = None
-        if condL is not None:
-            rx, ry, sx, sy = condL
-            x_mean = rx.mean(dim=-1, keepdim=True)
-            y_mean = ry.mean(dim=-1, keepdim=True)
-            sx = sx - x_mean
-            sy = sy - y_mean
-            rx = rx - x_mean
-            ry = ry - y_mean
-            pos_emb=torch.stack([rx,ry,sx,sy], dim=-1)
-            fourier_emb=self.fourier_encoder(pos_emb)
-        if fourier_emb is None:
-            dummy_pos_emb = torch.zeros(B, H, 4, device=x.device, dtype=x.dtype)
-            fourier_emb = self.fourier_encoder(dummy_pos_emb)
-        fourier_emb =fourier_emb+t.unsqueeze(1)
-        x=x.permute(0,2,3,1)                        
-        #x=x.permute(0,2,3,1)
-        for atten in self.attenL:
-            x= atten(x,fourier_emb)
-        shift, scale = self.adaLN_modulation(fourier_emb).chunk(2, dim=-1)
-        x = modulate(self.norm_final(x), shift.unsqueeze(-2), scale.unsqueeze(-2))
-        x = x.permute(0,3,1,2).contiguous()
-        x = self.to_unet(x)#+h0
-        for m in self.up:
-            if isinstance(m, Upsample):
-                x = m(x, t)
-            else:
-                s = h.pop()
-                x = torch.cat((x, s), dim=1)
-                x = m(x, t)    
-        A = torch.exp(self.A(x))*mask*STD +(1-mask)*a     
-        x=self.final(self.ac(self.norm(x)))
-        #print("x:",x.shape)
-        #print("A:",A.shape)
-        x=x*A
-        return x'''
 
 class SeisDiT(torch.nn.Module):
     ##adaLN-zero
@@ -1751,12 +1390,17 @@ class SeisDiTRopeV2(torch.nn.Module):
         self.num_layers = num_layers
         self.geom_mode = geom_mode
         self.missing_focus_adapter = missing_focus_adapter
-        #self.fourier_encoder=fourier_enoder.Seismic5DEncoder(coord_dim=4,max_freq=128,out_dim=d_model,num_bands=32,pe_type = pe_type)
-        self.tokenizer = torch.nn.Conv2d(
-            image_channels//2, n_channels, kernel_size=(1, 3), padding=(0, 1), bias=True
+
+        self.fourier_encoder = Seismic5DEncoder(
+            coord_dim=4, num_bands=32, max_freq=128,
+            include_input=True, out_dim=d_model, pe_type='log_spaced',
         )
-        self.tokenizer_c = torch.nn.Conv2d(image_channels//2, n_channels, (1,3), padding=(0,1), bias=True)
-        self.fuse = torch.nn.Conv2d(2*n_channels, n_channels, kernel_size=(1,1), padding=(0,0), bias=True)
+
+        self.tokenizer = torch.nn.Conv2d(
+            image_channels // 2, n_channels, kernel_size=(1, 5), padding=(0, 2), bias=True
+        )
+        self.tokenizer_c = torch.nn.Conv2d(image_channels // 2, n_channels, (1, 5), padding=(0, 2), bias=True)
+        self.fuse = torch.nn.Conv2d(2 * n_channels, n_channels, kernel_size=(1, 1), padding=(0, 0), bias=True)
         self.mask_adapter_n = torch.nn.Conv2d(
             n_channels, n_channels, kernel_size=(1, 3), padding=(0, 1), bias=True
         )
@@ -1772,20 +1416,15 @@ class SeisDiTRopeV2(torch.nn.Module):
         self.to_unet = torch.nn.Conv2d(
             d_model, last_channel, kernel_size=(1, 3), stride=(1, 1), padding=(0, 1), bias=True
         )
-        self.Geomlp = nn.Sequential(
-            nn.Linear(2, d_model*2),
-            nn.SiLU(),
-            nn.Linear(d_model*2, d_model),
-        )
-        nn.init.zeros_(self.Geomlp[-1].weight)
-        nn.init.zeros_(self.Geomlp[-1].bias)
-        self.geo_gate = nn.Linear(d_model, 1, bias=True)
-        nn.init.zeros_(self.geo_gate.weight)
-        nn.init.zeros_(self.geo_gate.bias)
+
         attenL = []
         for i in range(num_layers):
-            attenL.append(DiTBlockTrace(hidden_size=d_model, num_heads=nhead))
+            if i % 2 == 0:
+                attenL.append(DiTBlockTrace(hidden_size=d_model, num_heads=nhead))
+            else:
+                attenL.append(DiTBlockTime(hidden_size=d_model, num_heads=nhead))
         self.attenL = torch.nn.ModuleList(attenL)
+
         self.norm_final = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -1793,13 +1432,13 @@ class SeisDiTRopeV2(torch.nn.Module):
         )
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
-        
+
         down = []
         out_channels = in_channels = n_channels
         for i in range(n_res):
             out_channels = in_channels * channel[i]
             for _ in range(res_blocks):
-                down.append(Resblock(in_channels, out_channels, d_model))
+                down.append(Resblock(in_channels, out_channels, d_model, kernel_size=(1, 7)))
                 in_channels = out_channels
             if i < n_res - 1:
                 down.append(Downsample(in_channels, i, strides[i]))
@@ -1810,20 +1449,40 @@ class SeisDiTRopeV2(torch.nn.Module):
         for i in reversed(range(n_res)):
             out_channels = in_channels
             for _ in range(res_blocks):
-                up.append(Resblock(in_channels + out_channels, out_channels, d_model))
+                up.append(Resblock(in_channels + out_channels, out_channels, d_model, kernel_size=(1, 7)))
             out_channels = in_channels // channel[i]
-            up.append(Resblock(in_channels + out_channels, out_channels, d_model))
+            up.append(Resblock(in_channels + out_channels, out_channels, d_model, kernel_size=(1, 7)))
             in_channels = out_channels
             if i > 0:
                 up.append(Upsample(in_channels, i - 1, strides[i - 1]))
         self.up = torch.nn.ModuleList(up)
         self.ac = MYact()
-        self.norm = torch.nn.GroupNorm(8, in_channels, eps=1e-5)
+        self.norm = nn.InstanceNorm2d(in_channels, affine=True)
         self.final = torch.nn.Conv2d(
-            in_channels, output_channels, kernel_size=(1, 5), padding=(0, 2)
+            in_channels, output_channels, kernel_size=(1, 9), padding=(0, 4)
         )
         nn.init.zeros_(self.final.weight)
         nn.init.zeros_(self.final.bias)
+
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        兼容旧版 checkpoint: 将 Geomlp.* / geo_gate.* 映射为 fourier_encoder.*
+        （旧模型使用 2层MLP+gate，新模型使用 Seismic5DEncoder 多频段 Fourier 编码）
+        """
+        _state = dict(state_dict)
+        has_old_geomlp = any(k.startswith('Geomlp.') for k in _state)
+        has_new_fourier = any(k.startswith('fourier_encoder.') for k in _state)
+        if has_old_geomlp and not has_new_fourier:
+            import warnings
+            warnings.warn(
+                "Loading old-format checkpoint (Geomlp+geo_gate). "
+                "fourier_encoder weights will be random-initialized. "
+                "This model must be retrained or fine-tuned for best results."
+            )
+            for old_key in list(_state.keys()):
+                if old_key.startswith('Geomlp.') or old_key.startswith('geo_gate.'):
+                    del _state[old_key]
+        return super().load_state_dict(_state, strict=strict)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, condL=None, log_tau=None, time_axis=None, training=False):
         B, _, _, T = x.shape
@@ -1851,31 +1510,28 @@ class SeisDiTRopeV2(torch.nn.Module):
             x = x + (1 - mask) * self.mask_adapter_d(x)
         if condL is not None:
             rx, ry, sx, sy = condL
-            x_mean = sx.mean(dim=-1, keepdim=True)
-            y_mean = sy.mean(dim=-1, keepdim=True)
-            sx = sx - x_mean
-            sy = sy - y_mean
+            x_mean = rx.mean(dim=-1, keepdim=True)
+            y_mean = ry.mean(dim=-1, keepdim=True)
             rx = rx - x_mean
             ry = ry - y_mean
-            pos_emb = torch.stack([rx, ry, sx, sy], dim=-1) # (B, H, 4)
-            if self.geom_mode == "source":
-                geom_in = pos_emb[:, :, 2:4]
-            elif self.geom_mode == "receiver":
-                geom_in = pos_emb[:, :, 0:2]
-            else:
-                geom_in = torch.stack([sx - rx, sy - ry], dim=-1)
-            fourier_emb = self.Geomlp(geom_in)
+            sx = sx - x_mean
+            sy = sy - y_mean
+            pos_emb = torch.stack([rx, ry, sx, sy], dim=-1)
+            fourier_emb = self.fourier_encoder(pos_emb)
             rope_pos = pos_emb
-            
-            
-        #geo_scale = torch.tanh(self.geo_gate(fourier_emb))
-        fourier_emb = t.unsqueeze(1)+fourier_emb
-        
+        else:
+            _B, _, _H, _ = x.shape
+            dummy_pos_emb = torch.zeros(_B, _H, 4, device=x.device, dtype=x.dtype)
+            fourier_emb = self.fourier_encoder(dummy_pos_emb)
+            rope_pos = dummy_pos_emb
+
+        fourier_emb = t.unsqueeze(1) + fourier_emb
+
         x = x.permute(0, 2, 3, 1)
 
         for atten in self.attenL:
             x = atten(x, fourier_emb, rope_pos=rope_pos)
-        
+
         shift, scale = self.adaLN_modulation(fourier_emb).chunk(2, dim=-1)
         
         x = modulate(self.norm_final(x), shift.unsqueeze(-2), scale.unsqueeze(-2))
