@@ -127,6 +127,7 @@ class FlowMatchingModel(nn.Module):
         self.use_spectral_loss = use_spectral_loss
         self.spec_weight = spec_weight
         self.spec_alpha = spec_alpha
+        self.loss_weight_type = loss_weight
         
         # Create transport object
         self.transport = create_transport(
@@ -246,6 +247,10 @@ class FlowMatchingModel(nn.Module):
         loss_dict = self.transport.training_losses(wrapped_model, x, model_kwargs)
         loss = loss_dict['loss'].mean()
 
+        if self.loss_weight_type == 'logitnormal':
+            t_val = loss_dict['t']
+            w_t = (t_val * (1.0 - t_val) + 1e-4).detach()
+
         if self.use_multiscale_loss:
             pred = loss_dict['pred']
             ut = loss_dict['ut']
@@ -253,17 +258,19 @@ class FlowMatchingModel(nn.Module):
             ut_d2 = torch.nn.functional.avg_pool2d(ut, kernel_size=2)
             pred_d4 = torch.nn.functional.avg_pool2d(pred, kernel_size=4)
             ut_d4 = torch.nn.functional.avg_pool2d(ut, kernel_size=4)
-            loss = loss + self.multiscale_loss_weight * (
-                0.5 * torch.nn.functional.mse_loss(pred_d2, ut_d2) +
-                0.2 * torch.nn.functional.mse_loss(pred_d4, ut_d4)
-            )
+            ms_loss = 0.5 * torch.nn.functional.mse_loss(pred_d2, ut_d2) + \
+                      0.2 * torch.nn.functional.mse_loss(pred_d4, ut_d4)
+            if self.loss_weight_type == 'logitnormal':
+                ms_loss = ms_loss * w_t.mean()
+            loss = loss + self.multiscale_loss_weight * ms_loss
 
         if self.use_spectral_loss:
-            t_val = loss_dict['t']
-            xt = loss_dict['xt']
             pred = loss_dict['pred']
-            x1_hat = xt + (1.0 - t_val[:, None, None, None]) * pred
-            loss = loss + self.spec_weight * spectral_loss_1d(x1_hat, x, alpha=self.spec_alpha)
+            ut = loss_dict['ut']
+            spec_loss = spectral_loss_1d(pred, ut, alpha=self.spec_alpha)
+            if self.loss_weight_type == 'logitnormal':
+                spec_loss = spec_loss * w_t.mean()
+            loss = loss + self.spec_weight * spec_loss
 
         return loss
     
