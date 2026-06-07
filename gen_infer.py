@@ -37,7 +37,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 try:
     from tqdm import tqdm
 except Exception:
