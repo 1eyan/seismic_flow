@@ -1,0 +1,46 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# SEG-Y result files
+*.sgy
+*.segy
+
+# HDF5 result files
+*.h5
+*.hdf5
+
+# NumPy result files
+*.npy
+*.npz
+
+# Log files
+*.log
+
+# Result directories
+resultsFPM/
+gen_fill_results_1031field/
+
+# Dataset test output
+dataset/dataset_v2_test_output/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
