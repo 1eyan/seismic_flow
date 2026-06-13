@@ -1206,12 +1206,10 @@ class SeisDiT(torch.nn.Module):
         fourier_emb = None
         if condL is not None:
             rx, ry, sx, sy = condL
-            x_mean = rx.mean(dim=-1, keepdim=True)
-            y_mean = ry.mean(dim=-1, keepdim=True)
-            sx = sx - x_mean
-            sy = sy - y_mean
-            rx = rx - x_mean
-            ry = ry - y_mean
+            rx = rx - rx.mean(dim=-1, keepdim=True)
+            ry = ry - ry.mean(dim=-1, keepdim=True)
+            sx = sx - sx.mean(dim=-1, keepdim=True)
+            sy = sy - sy.mean(dim=-1, keepdim=True)
             pos_emb=torch.stack([rx,ry,sx,sy], dim=-1)
             fourier_emb=self.fourier_encoder(pos_emb)
         if fourier_emb is None:
@@ -1374,12 +1372,10 @@ class SeisDiTRope(torch.nn.Module):
         rope_pos = None
         if condL is not None:
             rx, ry, sx, sy = condL
-            x_mean = sx.mean(dim=-1, keepdim=True)
-            y_mean = sy.mean(dim=-1, keepdim=True)
-            sx = sx - x_mean
-            sy = sy - y_mean
-            rx = rx - x_mean
-            ry = ry - y_mean
+            rx = rx - rx.mean(dim=-1, keepdim=True)
+            ry = ry - ry.mean(dim=-1, keepdim=True)
+            sx = sx - sx.mean(dim=-1, keepdim=True)
+            sy = sy - sy.mean(dim=-1, keepdim=True)
             pos_emb = torch.stack([rx, ry, sx, sy], dim=-1) # (B, H, 4)
             fourier_emb = self.Geomlp(pos_emb)
             rope_pos = pos_emb
@@ -1433,7 +1429,6 @@ class SeisDiTRopeV2(torch.nn.Module):
         mlp_ratio=2.5,
         num_bands=16,
         max_freq=128,
-        geom_mode: str = "relative",
         missing_focus_adapter: bool = True,
     ):
         super(SeisDiTRopeV2, self).__init__()
@@ -1445,7 +1440,6 @@ class SeisDiTRopeV2(torch.nn.Module):
         self.nhead = nhead
         self.dropout = dropout
         self.num_layers = num_layers
-        self.geom_mode = geom_mode
         self.missing_focus_adapter = missing_focus_adapter
 
         self.fourier_encoder = Seismic5DEncoder(
@@ -1567,12 +1561,10 @@ class SeisDiTRopeV2(torch.nn.Module):
             x = x + (1 - mask) * self.mask_adapter_d(x)
         if condL is not None:
             rx, ry, sx, sy = condL
-            x_mean = rx.mean(dim=-1, keepdim=True)
-            y_mean = ry.mean(dim=-1, keepdim=True)
-            rx = rx - x_mean
-            ry = ry - y_mean
-            sx = sx - x_mean
-            sy = sy - y_mean
+            rx = rx - rx.mean(dim=-1, keepdim=True)
+            ry = ry - ry.mean(dim=-1, keepdim=True)
+            sx = sx - sx.mean(dim=-1, keepdim=True)
+            sy = sy - sy.mean(dim=-1, keepdim=True)
             pos_emb = torch.stack([rx, ry, sx, sy], dim=-1)
             fourier_emb = self.fourier_encoder(pos_emb)
             rope_pos = pos_emb

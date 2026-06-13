@@ -11,24 +11,24 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"  # >1 enables DDP via torchrun
-DEVICE="${DEVICE:-cuda:2}"  # only used in single-GPU mode
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"  # >1 enables DDP via torchrun
+DEVICE="${DEVICE:-cuda:0}"  # only used in single-GPU mode
 MASTER_PORT="${MASTER_PORT:-29503}"
 
-CHECKPOINT="${CHECKPOINT:-${ROOT_DIR}/resultsFPM/trace_axis_datatype_field1031_0517/checkpoints/model-epoch-50.pth}"
-H5_REGULAR="${H5_REGULAR:-/NAS/czt/mount/chengzhitong/data/测试数据/h5/field1031_label.h5}"
-H5_MASK="${H5_MASK:-/NAS/czt/mount/chengzhitong/data/测试数据/h5/field1031_mask.h5}"
-MASK_SEGY="${MASK_SEGY:-/NAS/czt/mount/chengzhitong/data/测试数据/mask_from_label.sgy}"
+CHECKPOINT="${CHECKPOINT:-/home/chengzhitong/5d_regular/seismic_flow_v2/CKP/model-epoch-50 (1).pth}"
+H5_REGULAR="${H5_REGULAR:-/data/shared/测试数据/h5/field1031_label.h5}"
+H5_MASK="${H5_MASK:-/data/shared/测试数据/h5/field1031_mask.h5}"
+MASK_SEGY="${MASK_SEGY:-/data/shared/测试数据/mask_from_label.sgy}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/gen_fill_results_1031field}"
 OUTPUT_SEGY="${OUTPUT_SEGY:-${OUTPUT_DIR}/filled_missing.sgy}"
 OUTPUT_RESIDUAL_SEGY="${OUTPUT_RESIDUAL_SEGY:-${OUTPUT_DIR}/residual.sgy}"
-LABEL_SEGY="${LABEL_SEGY:-/NAS/czt/mount/chengzhitong/data/测试数据/reg_pku_1031/reg_pku_1030/reg5dbin_label1031.sgy}"  # ground truth SEGY for residual computation (optional)
+LABEL_SEGY="${LABEL_SEGY:-/data/shared/测试数据/reg_pku_1031/reg_pku_1030/reg5dbin_label1031.sgy}"  # ground truth SEGY for residual computation (optional)
 
 SEGY_PROFILE="${SEGY_PROFILE:-field1031}"
 
 NUM_WORKERS="${NUM_WORKERS:-4}"
-INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-20}"  # patches per forward pass
+INFERENCE_BATCH_SIZE="${INFERENCE_BATCH_SIZE:-72}"  # patches per forward pass
 TRACE_PS="${TRACE_PS:-128}"  # patch trace count (must match training)
 OVERLAP_RATIO="${OVERLAP_RATIO:-0.5}"  # sliding window overlap (0.5 = 50% overlap, equal-weight averaging)
 TIME_PS="${TIME_PS:-1256}"
@@ -50,7 +50,6 @@ USE_MISSING_EMBEDDING="${USE_MISSING_EMBEDDING:-false}"
 USE_ENERGY_MLP="${USE_ENERGY_MLP:-false}"
 HEADWISE_ATTN_OUTPUT_GATE="${HEADWISE_ATTN_OUTPUT_GATE:-true}"
 ELEMENTWISE_ATTN_OUTPUT_GATE="${ELEMENTWISE_ATTN_OUTPUT_GATE:-false}"
-GEOM_MODE="${GEOM_MODE:-source}"
 USE_P_SCALE="${USE_P_SCALE:-true}"
 CHUNK_LENGTH_FLOW="${CHUNK_LENGTH_FLOW:-256}"
 
@@ -92,7 +91,6 @@ cmd=(
   --use_energy_mlp "${USE_ENERGY_MLP}"
   --headwise_attn_output_gate "${HEADWISE_ATTN_OUTPUT_GATE}"
   --elementwise_attn_output_gate "${ELEMENTWISE_ATTN_OUTPUT_GATE}"
-  --geom_mode "${GEOM_MODE}"
   --mlp_ratio "${MLP_RATIO}"
   --num_bands "${NUM_BANDS}"
   --use_p_scale "${USE_P_SCALE}"
@@ -149,7 +147,6 @@ echo "model_type    : ${MODEL_TYPE}"
 echo "inference_batch_size: ${INFERENCE_BATCH_SIZE}"
 echo "trace_ps      : ${TRACE_PS}"
 echo "overlap_ratio : ${OVERLAP_RATIO}"
-echo "geom_mode     : ${GEOM_MODE}"
 echo "use_p_scale   : ${USE_P_SCALE}"
 echo "path_type     : ${PATH_TYPE}"
 echo "prediction    : ${PREDICTION}"

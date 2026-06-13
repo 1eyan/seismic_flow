@@ -168,13 +168,6 @@ def config():
     parser.add_argument("--time_steps", type=int, default=1000, help="number of steps")
     parser.add_argument("--data_type", type=str, default="sim", help="no help")
     parser.add_argument("--model_type", type=str, default="trace_axis", help="model type")
-    parser.add_argument(
-        "--geom_mode",
-        type=str,
-        default="source",
-        choices=["source", "receiver", "relative"],
-        help="Geometry encoding mode for trace_axis model",
-    )
     parser.add_argument("--use_missing_embedding", type=str2bool, default=False, help="use missing focus adapter")
     parser.add_argument("--use_energy_mlp", type=str2bool, default=False, help="use energy stats")
     parser.add_argument("--headwise_attn_output_gate", type=str2bool, default=True, help="use headwise attn output gate")
@@ -201,7 +194,7 @@ def config():
         "--loss_weight",
         type=str,
         default=None,
-        choices=[None, "velocity", "likelihood", "logitnormal"],
+        choices=[None, "none", "velocity", "likelihood", "logitnormal"],
         help="Loss weighting type",
     )
     parser.add_argument(
@@ -791,15 +784,35 @@ def main():
     )
     #dataset init
     profile = get_segy_profile(args.segy_profile)
-    dataset = datasets_interp.DatasetH5_interp(
-        h5File_irregular=dataset_args.h5File,
-        h5File_regular=dataset_args.h5File_regular,
-        train_idx_np=None,
-        train=dataset_args.train,
-        missing_ratio_range=(0.3, 0.5),
-        use_p_scale=args.use_p_scale,
-        profile=profile,
-    )
+    dataset_mode = getattr(dataset_args, 'dataset_mode', 'interp')
+    if dataset_mode == 'ovtbin':
+        from dataset.datasets_ovtbin import DatasetH5_ovtbin
+        h5_grid = getattr(dataset_args, 'h5File_grid', None)
+        if h5_grid is None:
+            raise ValueError("--h5File_grid is required for dataset_mode=ovtbin")
+        dataset = DatasetH5_ovtbin(
+            h5_raw=dataset_args.h5File,
+            h5_grid=h5_grid,
+            h5_regular=dataset_args.h5File_regular,
+            train=True,
+            time_ps=getattr(dataset_args, 'time_ps', 1256),
+            trace_ps=getattr(dataset_args, 'trace_ps', 128),
+            ovt_target_slots=getattr(dataset_args, 'ovt_target_slots', 32),
+            kdtree_offset_weight=getattr(dataset_args, 'ovt_kdtree_offset_weight', 2.0),
+            profile=profile,
+        )
+        print('[OVTBIN] Using DatasetH5_ovtbin for training')
+    else:
+        dataset = datasets_interp.DatasetH5_interp(
+            h5File_irregular=dataset_args.h5File,
+            h5File_regular=dataset_args.h5File_regular,
+            train_idx_np=None,
+            train=dataset_args.train,
+            missing_ratio_range=(0.3, 0.5),
+            use_p_scale=args.use_p_scale,
+            profile=profile,
+        )
+
     #dataset_1 = datasets.DatasetH5_all_queryctx(h5File=dataset_args.h5File, h5File_regular=dataset_args.h5File_regular, h5File_tgt=dataset_args.h5File_tgt, dataset_neighbors=dataset_args.dataset_neighbors,train=dataset_args.train)
     #dataset_1 = datasets_interp.DatasetH5_interp(h5File_irregular=dataset_args.h5File, h5File_regular=dataset_args.h5File_regular, train_idx_np=dataset_args.train_idx_np, train=dataset_args.train, survey_line_key="recv_line", missing_ratio_range=(0.5, 0.7))
     #dataset_2 = datasets_interp.DatasetH5_interp(h5File_irregular=dataset_args.h5File_2, h5File_regular=dataset_args.h5File_regular_2,train_idx_np=dataset_args.train_idx_np_2, train=dataset_args.train, survey_line_key="recv_line", missing_ratio_range=(0.5, 0.7))
@@ -896,7 +909,6 @@ def main():
             mlp_ratio=4,
             num_bands=16,
             missing_focus_adapter=args.use_missing_embedding,
-            geom_mode=args.geom_mode,
         )
 
     print("time_steps:", args.time_steps)
@@ -925,7 +937,7 @@ def main():
         print(f"Pretrained weights loaded successfully from: {args.pretrained}")
     # ----------------------------------------------------------------
 
-    res_dir = f"./resultsFPM/{args.model_name}_datatype_{args.data_type}_0517"
+    res_dir = f"./resultsFPM/{args.model_name}_datatype_{args.data_type}_0613_ovt"
 
     # 将模型移动到正确的设备
     model_unet = model_unet.to(device)

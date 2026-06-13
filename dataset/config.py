@@ -26,5 +26,16 @@ parser.add_argument('--ovt_mask_mixture_json', type=str, default=None)
 parser.add_argument('--ovt_mask_seed', type=int, default=42)
 parser.add_argument('--ovt_mask_min_keep_cells', type=int, default=1)
 parser.add_argument('--ovt_mask_fallback_random', type=bool, default=True)
+parser.add_argument('--ovt_features', action='store_true',
+                    help='Use OVT kd-tree dataset instead of sliding window')
+parser.add_argument('--dataset_mode', type=str, default='interp',
+                    choices=['interp', 'ovtbin'],
+                    help='Dataset mode: interp (sliding window) or ovtbin (OVT SSL)')
+parser.add_argument('--h5File_grid', type=str, default=None,
+                    help='Grid H5 for OVT SSL (test_aligned.h5)')
+parser.add_argument('--ovt_target_slots', type=int, default=32,
+                    help='Number of target slots per patch for OVT SSL')
+parser.add_argument('--ovt_kdtree_offset_weight', type=float, default=2.0,
+                    help='Offset dimension weight in 4D KNN for OVT SSL')
 # 使用 parse_known_args 避免与主训练脚本的参数冲突（主脚本的 --model_name 等会保留给 train_fpmV3_ddp）
 args, _ = parser.parse_known_args()

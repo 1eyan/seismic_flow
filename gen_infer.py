@@ -37,7 +37,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+#os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 try:
     from tqdm import tqdm
 except Exception:
@@ -312,7 +312,10 @@ def partial_fill(args, headers, missing_global, pred_sum, pred_count, logger, pr
 def collate_patches(batch: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
     stacked = {}
     for key in ('data', 'masked_patch', 'trace_mask',
-                'sx_patch', 'sy_patch', 'rx_patch', 'ry_patch', 'key_values', 'trace_indices'):
+                'sx_patch', 'sy_patch', 'rx_patch', 'ry_patch',
+                'key_values', 'trace_indices',
+                'target_slot_mask', 'context_slot_mask', 'valid_trace_mask',
+                'cell_key_values'):
         if key in batch[0]:
             stacked[key] = np.stack([b[key] for b in batch])
     stacked['amp_scale'] = np.array([float(b.get('amp_scale', 1.0)) for b in batch], dtype=np.float32)
@@ -474,7 +477,6 @@ def make_backbone(args: argparse.Namespace) -> torch.nn.Module:
             mlp_ratio=getattr(args, 'mlp_ratio', 2.5),
             num_bands=getattr(args, 'num_bands', 16),
             missing_focus_adapter=args.use_missing_embedding,
-            geom_mode=args.geom_mode,
         )
     else:
         raise ValueError(f"Unsupported model_type={args.model_type!r}")
@@ -516,29 +518,59 @@ def flow_sample(
 
 
 def build_dataset(args, logger, profile: SegyProfile):
-    from dataset.datasets_interp_v2 import DatasetH5_interp
-    dataset = DatasetH5_interp(
-        h5File_irregular=args.h5_mask,
-        h5File_regular=args.h5_regular,
-        train=False,
-        missing_eps=args.h5_missing_eps,
-        time_ps=args.time_ps,
-        trace_ps=getattr(args, 'trace_ps', None),
-        overlap_ratio=getattr(args, 'overlap_ratio', 0.5),
-        use_p_scale=args.use_p_scale,
-        profile=profile,
-    )
-    logger.info(
-        "dataset ready: patches=%d time_ps=%d trace_ps=%d stride=%d overlap=%.2f",
-        len(dataset), dataset.time_ps, dataset.trace_ps, dataset.stride, dataset.overlap_ratio,
-    )
-    return dataset
+    dataset_mode = getattr(args, 'dataset_mode', 'interp')
+    if dataset_mode == 'ovtbin':
+        from dataset.datasets_ovtbin import DatasetH5_ovtbin
+        h5_grid = getattr(args, 'h5_mask', None)
+        h5_raw = getattr(args, 'h5_raw_context', None)
+        h5_regular = getattr(args, 'h5_regular', None)
+        if h5_grid is None:
+            raise ValueError("--h5_mask (grid H5) is required for dataset_mode=ovtbin")
+        if h5_raw is None:
+            raise ValueError("--h5_raw_context is required for dataset_mode=ovtbin")
+        if h5_regular is None:
+            raise ValueError("--h5_regular is required for dataset_mode=ovtbin")
+        dataset = DatasetH5_ovtbin(
+            h5_raw=h5_raw,
+            h5_grid=h5_grid,
+            h5_regular=h5_regular,
+            train=False,
+            time_ps=args.time_ps,
+            trace_ps=getattr(args, 'trace_ps', 128),
+            ovt_target_slots=getattr(args, 'ovt_target_slots', 32),
+            kdtree_offset_weight=getattr(args, 'ovt_kdtree_offset_weight', 2.0),
+            profile=profile,
+        )
+        logger.info(
+            "[OVTBIN] dataset ready: patches=%d time_ps=%d trace_ps=%d",
+            len(dataset), dataset.time_ps, dataset.trace_ps,
+        )
+        return dataset
+    else:
+        from dataset.datasets_interp_v2 import DatasetH5_interp
+        dataset = DatasetH5_interp(
+            h5File_irregular=args.h5_mask,
+            h5File_regular=args.h5_regular,
+            train=False,
+            missing_eps=args.h5_missing_eps,
+            time_ps=args.time_ps,
+            trace_ps=getattr(args, 'trace_ps', None),
+            overlap_ratio=getattr(args, 'overlap_ratio', 0.5),
+            use_p_scale=args.use_p_scale,
+            profile=profile,
+        )
+        logger.info(
+            "dataset ready: patches=%d time_ps=%d trace_ps=%d stride=%d overlap=%.2f",
+            len(dataset), dataset.time_ps, dataset.trace_ps, dataset.stride, dataset.overlap_ratio,
+        )
+        return dataset
 
 
 def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, dataset=None,
                      sampler=None, rank: int = 0, world_size: int = 1,
                      log_interval: int = 1,
                      headers=None, missing_global=None):
+    dataset_mode = getattr(args, 'dataset_mode', 'interp')
     if dataset is None:
         dataset = build_dataset(args, logger, profile)
 
@@ -553,6 +585,7 @@ def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, d
     )
 
     pred_sum, pred_count = {}, defaultdict(int)
+    grid_pred_sum, grid_pred_count = {}, defaultdict(int)
     # Incremental dicts: only accumulate predictions since the last backfill
     # This keeps all_gather_object small — just delta, not the entire accumulated dict.
     pred_sum_inc, pred_count_inc = {}, defaultdict(int)
@@ -596,23 +629,46 @@ def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, d
             trace_mask = trace_mask_all[s].astype(np.float32)
             scale = float(scale_all[s]) if scale_all.ndim > 0 else float(scale_all)
             pred = pred_all[s] * scale
-            missing = trace_mask < 0.5
             n_traces = int(trace_mask.size)
-            missing_count = int(missing.sum())
+
+            # OVT SSL mode: use target_slot_mask & valid_trace_mask for collection
+            if dataset_mode == 'ovtbin':
+                target_slot_mask = to_numpy(batch["target_slot_mask"][s]).astype(np.float32)
+                valid_mask = to_numpy(batch["valid_trace_mask"][s]).astype(np.float32)
+                collect_mask = (target_slot_mask >= 0.5) & (valid_mask >= 0.5)
+                sego_keys = to_numpy(batch["key_values"][s]).astype(np.int64)
+                missing_count = int(collect_mask.sum())
+
+                for j, should_collect in enumerate(collect_mask):
+                    if should_collect:
+                        # SEG-Y key for SEGY write-back (fill_and_verify)
+                        segy_key = tuple(int(v) for v in sego_keys[j])
+                        trace = fit_trace(pred[j], ns)
+                        add_prediction(pred_sum, pred_count, segy_key, trace)
+                        add_prediction(pred_sum_inc, pred_count_inc, segy_key, trace)
+                        # Cell key for filled_grid.h5 write-back
+                        if "cell_key_values" in batch:
+                            cell_key = tuple(int(v) for v in to_numpy(batch["cell_key_values"][s])[j])
+                            add_prediction(grid_pred_sum, grid_pred_count, cell_key, trace)
+            else:
+                missing = trace_mask < 0.5
+                missing_count = int(missing.sum())
+
+                for j, is_missing in enumerate(missing):
+                    if is_missing:
+                        key = tuple(int(v) for v in key_values_all[s, j])
+                        trace = fit_trace(pred[j], ns)
+                        add_prediction(pred_sum, pred_count, key, trace)
+                        add_prediction(pred_sum_inc, pred_count_inc, key, trace)
+
             total_missing += missing_count
             total_traces += n_traces
 
             if do_vis and global_sample_idx < vis_max:
-                masked_patch = x_all[s] * scale
-                data_gt = data_all[s] * scale
+                masked_patch = x_all[s] * scale   # un-normalize: /amp_thres * amp_thres = original
+                data_gt = data_all[s] * scale     # same: label values restored
+                # pred is already un-normalized at line 631 (pred_all[s] * scale)
                 visualize_batch(masked_patch, pred, data_gt, trace_mask, global_sample_idx, vis_dir)
-
-            for j, is_missing in enumerate(missing):
-                if is_missing:
-                    key = tuple(int(v) for v in key_values_all[s, j])
-                    trace = fit_trace(pred[j], ns)
-                    add_prediction(pred_sum, pred_count, key, trace)
-                    add_prediction(pred_sum_inc, pred_count_inc, key, trace)
 
             if args.progress and rank == 0 and s == current_bs - 1:
                 iterator.set_postfix(batch=batch_idx, total_traces=total_traces, total_missing=total_missing)
@@ -671,12 +727,78 @@ def infer_h5_dataset(args, fpm, device, logger, ns: int, profile: SegyProfile, d
         total_missing,
         len(pred_sum),
     )
-    return pred_sum, pred_count, seconds, {
+    return pred_sum, pred_count, grid_pred_sum, grid_pred_count, seconds, {
         "dataset_samples": int(global_sample_idx),
         "dataset_traces": int(total_traces),
         "dataset_missing": int(total_missing),
         "prediction_keys": int(len(pred_sum)),
     }
+
+
+def write_filled_grid_h5(
+    grid_path: str, output_path: str, pred_sum, pred_count, logger
+) -> dict:
+    """Write averaged predictions to a filled-grid H5.
+
+    Copies the input grid H5 and overwrites missing-cell data with averaged
+    predictions.  Observed cells are left untouched.
+    """
+    import h5py
+    import shutil
+
+    write_start = time.perf_counter()
+    shutil.copy2(grid_path, output_path)
+
+    written = 0
+    with h5py.File(output_path, "r+") as f:
+        for key in f:
+            node = f[key]
+            if hasattr(node, "keys") and "data" in node:
+                group = node
+                break
+        else:
+            raise ValueError(f"No data group found in {grid_path}")
+
+        cmp_line = group["cmp_line"][:].ravel()
+        cmp_val = group["cmp"][:].ravel()
+        ox_bin = group["offset_x_bin"][:].ravel()
+        oy_bin = group["offset_y_bin"][:].ravel()
+        data = group["data"]
+
+        # Build grid cell key → index lookup
+        grid_lookup: Dict[Tuple, int] = {}
+        for i in range(cmp_line.shape[0]):
+            ck = (int(cmp_line[i]), int(cmp_val[i]), int(ox_bin[i]), int(oy_bin[i]))
+            grid_lookup[ck] = i
+
+        # Add pred_count dataset if not present
+        if "pred_count" not in group:
+            pc_shape = (data.shape[0],)
+            if "pred_count" not in group:
+                group.create_dataset("pred_count", data=np.zeros(pc_shape, dtype=np.int32))
+
+        pred_count_ds = group["pred_count"]
+        trace_mask = group["trace_mask"][:].ravel().astype(np.float32)
+
+        for ck, total in pred_sum.items():
+            idx = grid_lookup.get(ck)
+            if idx is None:
+                continue
+            # Only overwrite missing cells
+            if trace_mask[idx] >= 0.5:
+                continue
+            avg = total / max(pred_count[ck], 1)
+            trace = fit_trace(avg, data.shape[1])
+            data[idx] = trace.astype(data.dtype)
+            pred_count_ds[idx] = int(pred_count[ck])
+            written += 1
+
+    seconds = time.perf_counter() - write_start
+    logger.info(
+        "filled_grid.h5 written: %s | cells_filled=%d write_sec=%.2f",
+        output_path, written, seconds,
+    )
+    return {"filled_cells": written, "write_seconds": seconds}
 
 
 def fill_and_verify(args, headers, missing_global, pred_sum, pred_count, logger,
@@ -817,6 +939,18 @@ def parse_args() -> argparse.Namespace:
                         help="Sliding window overlap ratio for patch-based inference")
     parser.add_argument("--missing_eps", type=float, default=1e-10)
     parser.add_argument("--h5_missing_eps", type=float, default=None, help="trace is missing in h5_mask if all abs(data) <= this; defaults to missing_eps")
+    parser.add_argument("--ovt_features", action="store_true", help="Use OVT kd-tree dataset for inference")
+    parser.add_argument("--dataset_mode", type=str, default="interp",
+                        choices=["interp", "ovtbin"],
+                        help="Dataset mode: interp or ovtbin (OVT SSL)")
+    parser.add_argument("--h5_raw_context", type=str, default=None,
+                        help="Raw irregular H5 for OVT SSL context pool")
+    parser.add_argument("--filled_grid_out", type=str, default=None,
+                        help="Output filled-grid H5 for OVT SSL inference")
+    parser.add_argument("--ovt_target_slots", type=int, default=32,
+                        help="Target slots per patch for OVT SSL")
+    parser.add_argument("--ovt_kdtree_offset_weight", type=float, default=2.0,
+                        help="Offset weight in 4D KNN for OVT SSL")
     parser.add_argument("--non_strict_load", dest="strict_load", action="store_false")
     parser.add_argument("--strict_fill", dest="strict_fill", action="store_true")
     parser.add_argument("--no_progress", dest="progress", action="store_false")
@@ -839,7 +973,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_missing_embedding", type=str2bool, default=True)
     parser.add_argument("--headwise_attn_output_gate", type=str2bool, default=True)
     parser.add_argument("--elementwise_attn_output_gate", type=str2bool, default=False)
-    parser.add_argument("--geom_mode", choices=["source", "receiver", "relative"], default="source")
     parser.add_argument("--mlp_ratio", type=float, default=2.5, help="MLP ratio for DiT blocks (must match training)")
     parser.add_argument("--num_bands", type=int, default=16, help="Fourier frequency bands (must match training)")
     parser.add_argument("--use_p_scale", type=str2bool, default=False, help="apply p_scale to gated model RoPE coordinates")
@@ -971,7 +1104,7 @@ def main() -> None:
         sampler = None
 
     log_interval = max(1, (len(dataset) // world_size) // 10) if world_size > 1 else max(1, len(dataset) // 10)
-    pred_sum, pred_count, inference_seconds, infer_stats = infer_h5_dataset(
+    pred_sum, pred_count, grid_pred_sum, grid_pred_count, inference_seconds, infer_stats = infer_h5_dataset(
         args, fpm, device, logger, ns=mask_data.shape[1], profile=profile, dataset=dataset,
         sampler=sampler, rank=rank, world_size=world_size,
         log_interval=log_interval,
@@ -1054,15 +1187,38 @@ def main() -> None:
         dist.barrier()
     
     if rank == 0:
-        print('begin fill segy ')
-        summary = fill_and_verify(args, headers, missing_global, pred_sum, pred_count,
-                                  logger, profile=profile, label_data=label_data)
-        summary.update({k: v for k, v in infer_stats.items() if k in ("dataset_traces", "dataset_missing", "prediction_keys")})
-        summary["inference_seconds"] = round(inference_seconds, 3)
-        summary["num_gpus"] = world_size
-        summary["total_seconds"] = round(time.perf_counter() - total_start, 3)
+        dataset_mode = getattr(args, 'dataset_mode', 'interp')
+        if dataset_mode == 'ovtbin':
+            # 1. SEGY write-back (same as interp mode)
+            print('begin fill segy (ovtbin) ')
+            summary = fill_and_verify(args, headers, missing_global, pred_sum, pred_count,
+                                      logger, profile=profile, label_data=label_data)
+            summary["dataset_mode"] = "ovtbin"
+            # 2. Optional: filled_grid.h5 from cell keys
+            if grid_pred_count:
+                filled_out = getattr(args, 'filled_grid_out', None)
+                if filled_out is None:
+                    filled_out = str(Path(args.output_dir) / "filled_grid.h5")
+                fg_summary = write_filled_grid_h5(
+                    args.h5_mask, filled_out, grid_pred_sum, grid_pred_count, logger
+                )
+                summary["filled_grid_out"] = filled_out
+                summary["filled_cells"] = fg_summary["filled_cells"]
+            summary.update({k: v for k, v in infer_stats.items() if k in ("dataset_traces", "dataset_missing", "prediction_keys")})
+            summary["inference_seconds"] = round(inference_seconds, 3)
+            summary["num_gpus"] = world_size
+            summary["total_seconds"] = round(time.perf_counter() - total_start, 3)
+            logger.info("done in %.2fs | output=%s", summary["total_seconds"], args.output_segy)
+        else:
+            print('begin fill segy ')
+            summary = fill_and_verify(args, headers, missing_global, pred_sum, pred_count,
+                                      logger, profile=profile, label_data=label_data)
+            summary.update({k: v for k, v in infer_stats.items() if k in ("dataset_traces", "dataset_missing", "prediction_keys")})
+            summary["inference_seconds"] = round(inference_seconds, 3)
+            summary["num_gpus"] = world_size
+            summary["total_seconds"] = round(time.perf_counter() - total_start, 3)
+            logger.info("done in %.2fs | output=%s", summary["total_seconds"], args.output_segy)
         (Path(args.output_dir) / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-        logger.info("done in %.2fs | output=%s", summary["total_seconds"], args.output_segy)
 
     if world_size > 1:
         dist.destroy_process_group()

@@ -30,7 +30,6 @@ SEGY_PROFILE="${SEGY_PROFILE:-field1031}"  # sw06 | field1031 | segc3
 USE_P_SCALE="${USE_P_SCALE:-true}"
 USE_MISSING_EMBEDDING="${USE_MISSING_EMBEDDING:-false}"
 USE_ENERGY_MLP="${USE_ENERGY_MLP:-false}"
-GEOM_MODE="${GEOM_MODE:-source}"  # source | receiver | relative
 HEADWISE_ATTN_OUTPUT_GATE="${HEADWISE_ATTN_OUTPUT_GATE:-true}"
 ELEMENTWISE_ATTN_OUTPUT_GATE="${ELEMENTWISE_ATTN_OUTPUT_GATE:-false}"
 PATH_TYPE="${PATH_TYPE:-Linear}"  # Linear | GVP | VP
@@ -55,7 +54,6 @@ echo "Epochs: $EPOCHS"
 echo "Model Type: $MODEL_TYPE"
 echo "Data Type: $DATA_TYPE"
 echo "segy_profile: $SEGY_PROFILE"
-echo "geom_mode: $GEOM_MODE"
 echo "use_p_scale: $USE_P_SCALE"
 echo "loss_weight: $LOSS_WEIGHT"
 echo "use_multiscale_loss: $USE_MULTISCALE_LOSS"
@@ -77,7 +75,6 @@ accelerate launch --config_file accelerate_config.yaml --main_process_port 29501
     --use_p_scale $USE_P_SCALE \
     --use_missing_embedding $USE_MISSING_EMBEDDING \
     --use_energy_mlp $USE_ENERGY_MLP \
-    --geom_mode $GEOM_MODE \
     --headwise_attn_output_gate $HEADWISE_ATTN_OUTPUT_GATE \
     --elementwise_attn_output_gate $ELEMENTWISE_ATTN_OUTPUT_GATE \
     --path_type $PATH_TYPE \

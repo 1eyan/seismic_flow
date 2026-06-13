@@ -12,7 +12,7 @@ PY_SCRIPT="${SCRIPT_DIR}/ovtbin_h5.py"
 # Env overrides are supported for every variable below.
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-RUN_MODE="${RUN_MODE:-project_irregular}"  # build_grid | project_irregular
+RUN_MODE="${RUN_MODE:-build_grid}"  # build_grid | project_irregular
 DRY_RUN="${DRY_RUN:-false}"
 
 LABEL_INPUT="${LABEL_INPUT:-/NAS/czt/mount/chengzhitong/data/测试数据/h5/field1031_label.h5}"
@@ -37,8 +37,8 @@ RECEIVER_LINE_INTERVAL="${RECEIVER_LINE_INTERVAL:-200}"
 GAMMA="${GAMMA:-2.0}"
 
 # --- Shifts ---
-OFFSET_X_SHIFT="${OFFSET_X_SHIFT:--200.0}"
-OFFSET_Y_SHIFT="${OFFSET_Y_SHIFT:--200.0}"
+OFFSET_X_SHIFT="${OFFSET_X_SHIFT:-}"   # auto: -bin_x/2
+OFFSET_Y_SHIFT="${OFFSET_Y_SHIFT:-}"   # auto: -bin_y/2
 
 # --- 4D cell projection ---
 PROJECTION_MODE="${PROJECTION_MODE:-cell}"              # cell | trace-key
@@ -46,6 +46,7 @@ MIDPOINT_BIN_MODE="${MIDPOINT_BIN_MODE:-cmp}"           # cmp | coordinate
 MIDPOINT_KEY_COLUMNS="${MIDPOINT_KEY_COLUMNS:-cmp_line,cmp}"
 INPUT_DUPLICATE_POLICY="${INPUT_DUPLICATE_POLICY:-mean}"  # mean | error | first
 OUTSIDE_GRID_POLICY="${OUTSIDE_GRID_POLICY:-skip}"        # skip | error
+ALLOW_OUTSIDE_GRID="${ALLOW_OUTSIDE_GRID:-false}"
 KEY_COLUMNS="${KEY_COLUMNS:-shot_line,shot_stake,recv_line,recv_stake}"
 
 # --- Output options ---
@@ -97,8 +98,6 @@ cmd=(
     --segy-profile "${SEGY_PROFILE}"
     --wave-type "${WAVE_TYPE}"
     --binning-mode "${BINNING_MODE}"
-    --offset-x-shift "${OFFSET_X_SHIFT}"
-    --offset-y-shift "${OFFSET_Y_SHIFT}"
     --gamma "${GAMMA}"
     --missing-eps "${MISSING_EPS}"
     --projection-mode "${PROJECTION_MODE}"
@@ -107,6 +106,9 @@ cmd=(
     --input-duplicate-policy "${INPUT_DUPLICATE_POLICY}"
     --outside-grid-policy "${OUTSIDE_GRID_POLICY}"
 )
+
+[[ -n "${OFFSET_X_SHIFT}" ]] && cmd+=(--offset-x-shift "${OFFSET_X_SHIFT}")
+[[ -n "${OFFSET_Y_SHIFT}" ]] && cmd+=(--offset-y-shift "${OFFSET_Y_SHIFT}")
 
 if [[ "${PROJECTION_MODE}" == "trace-key" && -n "${KEY_COLUMNS}" ]]; then
     cmd+=(--key-columns "${KEY_COLUMNS}")
@@ -139,6 +141,9 @@ if [[ -n "${GRID_SPEC_OUT}" ]]; then
 fi
 if [[ "${ALIGN_TO_GRID}" == "true" ]]; then
     cmd+=(--align-to-grid)
+fi
+if [[ "${ALLOW_OUTSIDE_GRID}" == "true" ]]; then
+    cmd+=(--allow-outside-grid)
 fi
 
 if [[ "${OVERWRITE_OUTPUT}" == "true" ]]; then

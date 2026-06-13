@@ -285,12 +285,10 @@ class GatedSeisDiT(nn.Module):
         # ---- Build coords: (B, H, 4) with centering ----
         if condL is not None:
             rx, ry, sx, sy = condL
-            x_mean = sx.mean(dim=-1, keepdim=True)
-            y_mean = sy.mean(dim=-1, keepdim=True)
-            sx_c = sx - x_mean
-            sy_c = sy - y_mean
-            rx_c = rx - x_mean
-            ry_c = ry - y_mean
+            sx_c = sx - sx.mean(dim=-1, keepdim=True)
+            sy_c = sy - sy.mean(dim=-1, keepdim=True)
+            rx_c = rx - rx.mean(dim=-1, keepdim=True)
+            ry_c = ry - ry.mean(dim=-1, keepdim=True)
             coords = torch.stack([rx_c, ry_c, sx_c, sy_c], dim=-1)
         else:
             coords = torch.zeros(B, H, 4, device=x.device, dtype=x.dtype)

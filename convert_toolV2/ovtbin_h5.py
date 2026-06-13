@@ -267,24 +267,35 @@ def _ovt_from_bins(
     if n_y <= 0:
         raise ValueError(f"Invalid OVT grid ny={n_y}")
 
-    if (
-        not allow_outside_grid
-        and (offset_x_bin.min() < min_x or offset_x_bin.max() > max_x)
-    ):
-        raise ValueError(
-            "offset_x_bin outside reference grid: "
-            f"data=[{int(offset_x_bin.min())}, {int(offset_x_bin.max())}] "
-            f"grid=[{min_x}, {max_x}]"
-        )
-    if (
-        not allow_outside_grid
-        and (offset_y_bin.min() < min_y or offset_y_bin.max() > max_y)
-    ):
-        raise ValueError(
-            "offset_y_bin outside reference grid: "
-            f"data=[{int(offset_y_bin.min())}, {int(offset_y_bin.max())}] "
-            f"grid=[{min_y}, {max_y}]"
-        )
+    if allow_outside_grid:
+        # Clip bin indices to reference grid boundaries so OVT numbers stay valid.
+        clipped_x = np.clip(offset_x_bin, min_x, max_x)
+        clipped_y = np.clip(offset_y_bin, min_y, max_y)
+        n_clipped_x = int((offset_x_bin != clipped_x).sum())
+        n_clipped_y = int((offset_y_bin != clipped_y).sum())
+        if n_clipped_x or n_clipped_y:
+            print(
+                f"[WARNING] Clipping offset bins to reference grid: "
+                f"{n_clipped_x} trace(s) on offset_x_bin, "
+                f"{n_clipped_y} trace(s) on offset_y_bin. "
+                f"Grid x=[{min_x}, {max_x}] y=[{min_y}, {max_y}]",
+                file=sys.stderr,
+            )
+        offset_x_bin = clipped_x
+        offset_y_bin = clipped_y
+    else:
+        if offset_x_bin.min() < min_x or offset_x_bin.max() > max_x:
+            raise ValueError(
+                "offset_x_bin outside reference grid: "
+                f"data=[{int(offset_x_bin.min())}, {int(offset_x_bin.max())}] "
+                f"grid=[{min_x}, {max_x}]"
+            )
+        if offset_y_bin.min() < min_y or offset_y_bin.max() > max_y:
+            raise ValueError(
+                "offset_y_bin outside reference grid: "
+                f"data=[{int(offset_y_bin.min())}, {int(offset_y_bin.max())}] "
+                f"grid=[{min_y}, {max_y}]"
+            )
 
     ovt = (offset_x_bin.astype(np.int64) - min_x) * n_y
     ovt += offset_y_bin.astype(np.int64) - min_y + 1
@@ -312,8 +323,8 @@ def compute_cartesian_ovt(
     source_line_interval: Optional[float] = None,
     receiver_line_interval: Optional[float] = None,
     gamma: float = 2.0,
-    offset_x_shift: float = 0.0,
-    offset_y_shift: float = 0.0,
+    offset_x_shift: Optional[float] = None,
+    offset_y_shift: Optional[float] = None,
     swap: bool = False,
     grid_spec: Optional[Mapping[str, object]] = None,
     allow_outside_grid: bool = False,
@@ -341,8 +352,8 @@ def compute_cartesian_ovt(
             receiver_line_interval=receiver_line_interval,
             gamma=gamma,
         )
-        shift_x = _validate_shift("offset_x_shift", offset_x_shift, bin_x)
-        shift_y = _validate_shift("offset_y_shift", offset_y_shift, bin_y)
+        shift_x = -0.5 * bin_x if offset_x_shift is None else _validate_shift("offset_x_shift", offset_x_shift, bin_x)
+        shift_y = -0.5 * bin_y if offset_y_shift is None else _validate_shift("offset_y_shift", offset_y_shift, bin_y)
 
     sx = np.asarray(sx, dtype=np.float64)
     sy = np.asarray(sy, dtype=np.float64)
@@ -357,6 +368,8 @@ def compute_cartesian_ovt(
     offset = np.hypot(offset_x, offset_y)
     azimuth = (np.degrees(np.arctan2(offset_y, offset_x)) + 360.0) % 360.0
     azimuth = np.where(offset == 0.0, 0.0, azimuth)
+    midpoint_x = 0.5 * (sx + rx)
+    midpoint_y = 0.5 * (sy + ry)
 
     offset_x_bin = np.floor((offset_x - shift_x) / bin_x).astype(np.int64)
     offset_y_bin = np.floor((offset_y - shift_y) / bin_y).astype(np.int64)
@@ -409,6 +422,8 @@ def compute_cartesian_ovt(
         "offset_y_bin": _as_int32("offset_y_bin", offset_y_bin),
         "offset_x_center": offset_x_center.astype(np.float32),
         "offset_y_center": offset_y_center.astype(np.float32),
+        "midpoint_x": midpoint_x.astype(np.float32),
+        "midpoint_y": midpoint_y.astype(np.float32),
         "ovt": ovt,
         "ovt_fold": ovt_fold,
         "attrs": attrs,
@@ -650,16 +665,24 @@ def write_ovt_to_group(group, ovt: Mapping[str, object], *, overwrite: bool) -> 
         group.attrs[key] = value
 
 
-def write_qc_outputs(ovt: Mapping[str, object], qc_dir: str | os.PathLike[str]) -> None:
+def write_qc_outputs(
+    ovt: Mapping[str, object],
+    qc_dir: str | os.PathLike[str],
+    *,
+    midpoint_bin_size: Optional[float] = None,
+) -> None:
     qc_path = Path(qc_dir)
     qc_path.mkdir(parents=True, exist_ok=True)
 
     attrs = dict(ovt["attrs"])
     ovt_ids = np.asarray(ovt["ovt"])
     folds = np.asarray(ovt["ovt_fold"])
+    n_traces = int(ovt_ids.size)
     unique_ovt, counts = np.unique(ovt_ids, return_counts=True)
+
+    # ---- basic summary ----
     summary = {
-        "trace_count": int(ovt_ids.size),
+        "trace_count": n_traces,
         "unique_ovt_count": int(unique_ovt.size),
         "min_fold": int(folds.min()) if folds.size else 0,
         "max_fold": int(folds.max()) if folds.size else 0,
@@ -669,18 +692,30 @@ def write_qc_outputs(ovt: Mapping[str, object], qc_dir: str | os.PathLike[str]) 
     with open(qc_path / "ovtbin_summary.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, sort_keys=True)
 
+    # ---- per-OVT fold histogram ----
     with open(qc_path / "ovt_fold_hist.csv", "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["ovt", "fold"])
         for ovt_id, count in zip(unique_ovt, counts):
             writer.writerow([int(ovt_id), int(count)])
 
+    # ---- per-OVT-per-CMP fold & duplicate rate ----
+    if n_traces > 0 and "midpoint_x" in ovt and "midpoint_y" in ovt:
+        mpx = np.asarray(ovt["midpoint_x"])
+        mpy = np.asarray(ovt["midpoint_y"])
+        _write_per_ovt_cmp_qc(
+            ovt_ids, mpx, mpy, n_traces, attrs, qc_path,
+            midpoint_bin_size=midpoint_bin_size,
+        )
+
+    # ---- plots ----
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except ImportError:
-        print("matplotlib is not available; skipped QC scatter plot.", file=sys.stderr)
+        print("matplotlib is not available; skipped QC plots.", file=sys.stderr)
         return
 
+    # scatter plot
     fig, ax = plt.subplots(figsize=(8, 7), dpi=150)
     sc = ax.scatter(
         np.asarray(ovt["offset_x"]),
@@ -699,6 +734,196 @@ def write_qc_outputs(ovt: Mapping[str, object], qc_dir: str | os.PathLike[str]) 
     fig.tight_layout()
     fig.savefig(qc_path / "offset_xy_ovt_scatter.png")
     plt.close(fig)
+
+    # heatmap: OVT grid population
+    if "offset_x_bin" in ovt and "offset_y_bin" in ovt:
+        _write_ovt_grid_heatmap(
+            np.asarray(ovt["offset_x_bin"]),
+            np.asarray(ovt["offset_y_bin"]),
+            ovt_ids,
+            attrs,
+            qc_path,
+        )
+
+
+def _estimate_spatial_bin(x: np.ndarray, y: np.ndarray, fallback: float = 50.0) -> float:
+    """Estimate spatial bin size from coordinate data.
+
+    Uses the median spacing between unique sorted coordinate values.
+    Falls back to *fallback* (metres) for tiny datasets.
+    """
+    bins: list[float] = []
+    for coord in (x, y):
+        if coord.size < 2:
+            continue
+        uniq = np.unique(coord)
+        if uniq.size < 2:
+            continue
+        diffs = np.diff(uniq)
+        diffs = diffs[diffs > 0]
+        if diffs.size:
+            bins.append(float(np.median(diffs)))
+    if not bins:
+        return fallback
+    # Round to a sensible number
+    raw = float(np.median(bins))
+    # Snap to common bin sizes: 12.5, 25, 50, 100, 200, 400
+    candidates = [12.5, 25.0, 50.0, 100.0, 200.0, 400.0]
+    best = min(candidates, key=lambda c: abs(c - raw))
+    return best if abs(best - raw) / max(raw, 1e-9) < 0.5 else raw
+
+
+def _write_per_ovt_cmp_qc(
+    ovt_ids: np.ndarray,
+    midpoint_x: np.ndarray,
+    midpoint_y: np.ndarray,
+    n_traces: int,
+    attrs: dict,
+    qc_path: Path,
+    *,
+    midpoint_bin_size: Optional[float] = None,
+) -> None:
+    """Write per-OVT-per-CMP fold statistics and duplicate rate."""
+    # Determine midpoint bin size: use user-provided, else auto-estimate from data spacing, else 50m
+    if midpoint_bin_size is None:
+        midpoint_bin_size = _estimate_spatial_bin(midpoint_x, midpoint_y)
+
+    # Compute midpoint bins
+    mpx_bin = np.floor(midpoint_x / midpoint_bin_size).astype(np.int64)
+    mpy_bin = np.floor(midpoint_y / midpoint_bin_size).astype(np.int64)
+
+    # Per-OVT-per-CMP fold aggregation
+    unique_ovts = np.unique(ovt_ids)
+    per_ovt_cmp_folds: List[float] = []       # mean fold per CMP within each OVT
+    per_ovt_cmp_counts: List[int] = []         # unique CMP count per OVT
+    per_ovt_duplicate_rates: List[float] = []  # duplicate rate per OVT
+
+    for ovt_id in unique_ovts:
+        mask = ovt_ids == ovt_id
+        ovt_n = int(mask.sum())
+        # Pack (mpx_bin, mpy_bin) into a single int64 key for fast unique
+        keys = (mpx_bin[mask].astype(np.int64) << 32) | (mpy_bin[mask].astype(np.int64) & 0xFFFFFFFF)
+        unique_keys, key_counts = np.unique(keys, return_counts=True)
+        n_unique = int(unique_keys.size)
+        per_ovt_cmp_counts.append(n_unique)
+        if n_unique > 0:
+            per_ovt_cmp_folds.append(float(ovt_n) / float(n_unique))
+            per_ovt_duplicate_rates.append(1.0 - float(n_unique) / float(ovt_n))
+        else:
+            per_ovt_cmp_folds.append(0.0)
+            per_ovt_duplicate_rates.append(0.0)
+
+    # Global unique CMP bins
+    n_unique_all = int(np.unique(np.stack([mpx_bin, mpy_bin], axis=1), axis=0).shape[0])
+    # Unique (OVT, CMP) pairs — stack three columns for correct uniqueness
+    stacked = np.stack([ovt_ids.astype(np.int64), mpx_bin, mpy_bin], axis=1)
+    n_unique_ovt_cmp = int(np.unique(stacked, axis=0).shape[0])
+
+    ovt_cmp_dup = {
+        "midpoint_bin_size": float(midpoint_bin_size),
+        "total_traces": n_traces,
+        "unique_cmp_bins_global": n_unique_all,
+        "unique_ovt_cmp_pairs": n_unique_ovt_cmp,
+        "ovt_cmp_duplicate_traces": n_traces - n_unique_ovt_cmp,
+        "ovt_cmp_duplicate_rate": round(1.0 - n_unique_ovt_cmp / max(n_traces, 1), 6),
+        "per_ovt_cmp_fold": {
+            "mean": round(float(np.mean(per_ovt_cmp_folds)), 2),
+            "median": round(float(np.median(per_ovt_cmp_folds)), 2),
+            "p99": round(float(np.percentile(per_ovt_cmp_folds, 99)), 2),
+            "min": round(float(np.min(per_ovt_cmp_folds)), 2),
+            "max": round(float(np.max(per_ovt_cmp_folds)), 2),
+            "fraction_lt_10": round(
+                float(np.mean(np.array(per_ovt_cmp_folds) < 10)), 4
+            ),
+            "fraction_gt_50": round(
+                float(np.mean(np.array(per_ovt_cmp_folds) > 50)), 4
+            ),
+        },
+        "per_ovt_duplicate_rate": {
+            "mean": round(float(np.mean(per_ovt_duplicate_rates)), 6),
+            "median": round(float(np.median(per_ovt_duplicate_rates)), 6),
+            "max": round(float(np.max(per_ovt_duplicate_rates)), 6),
+        },
+    }
+    with open(qc_path / "ovt_cmp_duplicate.json", "w", encoding="utf-8") as fh:
+        json.dump(ovt_cmp_dup, fh, indent=2, sort_keys=True)
+
+    # Per-OVT-per-CMP fold CSV
+    with open(qc_path / "per_ovt_cmp_fold.csv", "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["ovt", "n_traces", "unique_cmp", "mean_cmp_fold", "duplicate_rate"])
+        for i, ovt_id in enumerate(unique_ovts):
+            writer.writerow([
+                int(ovt_id),
+                int((ovt_ids == ovt_id).sum()),
+                per_ovt_cmp_counts[i],
+                round(per_ovt_cmp_folds[i], 4),
+                round(per_ovt_duplicate_rates[i], 6),
+            ])
+
+    # Print summary to stdout
+    print(f"[QC] midpoint bin size: {midpoint_bin_size:.1f}m")
+    print(f"[QC] unique CMP bins (global): {n_unique_all}")
+    print(f"[QC] unique OVT-CMP pairs: {n_unique_ovt_cmp}")
+    dup_pct = ovt_cmp_dup["ovt_cmp_duplicate_rate"] * 100
+    print(f"[QC] OVT-CMP duplicate rate: {dup_pct:.2f}% ({n_traces - n_unique_ovt_cmp} / {n_traces} traces)")
+    print(f"[QC] per-OVT-per-CMP fold: mean={ovt_cmp_dup['per_ovt_cmp_fold']['mean']:.1f}, "
+          f"median={ovt_cmp_dup['per_ovt_cmp_fold']['median']:.1f}, "
+          f"p99={ovt_cmp_dup['per_ovt_cmp_fold']['p99']:.1f}")
+    print(f"[QC]   fold < 10: {ovt_cmp_dup['per_ovt_cmp_fold']['fraction_lt_10']*100:.2f}% OVTs, "
+          f"fold > 50: {ovt_cmp_dup['per_ovt_cmp_fold']['fraction_gt_50']*100:.2f}% OVTs")
+
+
+def _write_ovt_grid_heatmap(
+    offset_x_bin: np.ndarray,
+    offset_y_bin: np.ndarray,
+    ovt_ids: np.ndarray,
+    attrs: dict,
+    qc_path: Path,
+) -> None:
+    """Write a 2D heatmap of OVT grid population."""
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:
+        return
+
+    x_min = int(offset_x_bin.min())
+    x_max = int(offset_x_bin.max())
+    y_min = int(offset_y_bin.min())
+    y_max = int(offset_y_bin.max())
+    nx = x_max - x_min + 1
+    ny = y_max - y_min + 1
+
+    # Build 2D histogram: count traces per (offset_x_bin, offset_y_bin)
+    grid = np.zeros((ny, nx), dtype=np.int64)
+    for xb, yb in zip(offset_x_bin, offset_y_bin):
+        grid[yb - y_min, xb - x_min] += 1
+
+    fig, ax = plt.subplots(figsize=(max(8, nx * 0.12), max(7, ny * 0.12)), dpi=150)
+    im = ax.imshow(
+        grid,
+        origin="lower",
+        aspect="auto",
+        cmap="YlOrRd",
+        extent=[x_min - 0.5, x_max + 0.5, y_min - 0.5, y_max + 0.5],
+    )
+    ax.set_xlabel("offset_x_bin")
+    ax.set_ylabel("offset_y_bin")
+    ax.set_title(f"OVT grid population (nx={nx}, ny={ny}, cells={nx * ny})")
+    fig.colorbar(im, ax=ax, label="trace count")
+    fig.tight_layout()
+    fig.savefig(qc_path / "ovt_grid_heatmap.png")
+    plt.close(fig)
+
+    # Also write a CSV of the grid for downstream use
+    with open(qc_path / "ovt_grid_heatmap.csv", "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["offset_x_bin", "offset_y_bin", "trace_count"])
+        for iy in range(ny):
+            for ix in range(nx):
+                count = int(grid[iy, ix])
+                if count > 0:
+                    writer.writerow([x_min + ix, y_min + iy, count])
 
 
 def _log_grid_spec(spec: Mapping[str, object]) -> None:
@@ -1155,7 +1380,10 @@ def process_h5(args: argparse.Namespace) -> None:
                     )
                 _log_projection_stats(stats, mode=args.projection_mode)
                 sx, sy, rx, ry = _load_h5_coordinates(out_group)
-                ovt = compute_cartesian_ovt(sx, sy, rx, ry, grid_spec=spec)
+                ovt = compute_cartesian_ovt(
+                    sx, sy, rx, ry, grid_spec=spec,
+                    allow_outside_grid=args.allow_outside_grid,
+                )
                 _log_fold_stats(np.asarray(ovt["ovt_fold"]), label="grid output ")
                 write_ovt_to_group(out_group, ovt, overwrite=False)
                 if args.projection_mode == "cell":
@@ -1213,6 +1441,7 @@ def process_h5(args: argparse.Namespace) -> None:
                 offset_y_shift=args.offset_y_shift,
                 swap=args.swap,
                 grid_spec=spec,
+                allow_outside_grid=args.allow_outside_grid,
             )
             _log_fold_stats(np.asarray(ovt["ovt_fold"]), label=f"group {args.group_name} ")
             write_ovt_to_group(group, ovt, overwrite=args.overwrite_fields)
@@ -1311,6 +1540,7 @@ def process_segy(args: argparse.Namespace) -> None:
             offset_y_shift=args.offset_y_shift,
             swap=args.swap,
             grid_spec=spec,
+            allow_outside_grid=args.allow_outside_grid,
         )
         _log_fold_stats(np.asarray(ovt["ovt_fold"]), label=f"group {args.group_name} ")
         write_ovt_to_group(group, ovt, overwrite=False)
@@ -1415,6 +1645,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["skip", "error"],
         help="How to handle input 4D cells not present in the regular grid",
     )
+    parser.add_argument(
+        "--allow-outside-grid", action="store_true",
+        help="Clip offset bins to reference grid boundaries instead of raising an error",
+    )
     parser.add_argument("--missing-fill", default="zero", choices=["zero"])
     parser.add_argument("--missing-eps", type=float, default=1e-10)
 
@@ -1425,8 +1659,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-line-interval", type=float, default=None)
     parser.add_argument("--receiver-line-interval", type=float, default=None)
     parser.add_argument("--gamma", "--effective-gamma", dest="gamma", type=float, default=2.0)
-    parser.add_argument("--offset-x-shift", type=float, default=0.0)
-    parser.add_argument("--offset-y-shift", type=float, default=0.0)
+    parser.add_argument("--offset-x-shift", type=float, default=None)
+    parser.add_argument("--offset-y-shift", type=float, default=None)
     parser.add_argument("--swap", action="store_true")
 
     parser.add_argument("--overwrite-output", action="store_true")
