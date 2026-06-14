@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.pyo
+accelerate_config.yaml
 
 # Model checkpoints
 *.pth
@@ -27,6 +28,7 @@ __pycache__/
 # Result directories
 resultsFPM/
 gen_fill_results_1031field/
+gen_fill_*
 
 # Dataset test output
 dataset/dataset_v2_test_output/
@@ -44,3 +46,8 @@ Thumbs.db
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+CKP
+test_*.py
+vis_output
+ovt_plots
+*.pyc

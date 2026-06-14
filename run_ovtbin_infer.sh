@@ -71,8 +71,9 @@ SDE_SAMPLING_METHOD="${SDE_SAMPLING_METHOD:-Euler}"
 SDE_NUM_STEPS="${SDE_NUM_STEPS:-250}"
 
 # ---- Additional ----
+FULL_COVERAGE="${FULL_COVERAGE:-true}"  # 全量推理：遍历全部网格单元（observed+missing）恰好一次
 VISUALIZE="${VISUALIZE:-true}"
-VIS_BATCHES="${VIS_BATCHES:-1}"
+VIS_BATCHES="${VIS_BATCHES:-0}"
 BACKFILL_INTERVAL="${BACKFILL_INTERVAL:-1}"
 HEADER_MODE="${HEADER_MODE:-fixed}"
 SORT_OUTPUT="${SORT_OUTPUT:-true}"
@@ -91,6 +92,7 @@ echo "output_segy:    ${OUTPUT_SEGY}"
 echo "filled_grid:    ${FILLED_GRID_OUT}"
 echo "model_type:     ${MODEL_TYPE}"
 echo "use_p_scale:    ${USE_P_SCALE}"
+echo "full_coverage:  ${FULL_COVERAGE}"
 echo "nproc_per_node: ${NPROC_PER_NODE}"
 echo "============================================================"
 
@@ -141,6 +143,10 @@ cmd=(
 
 if [[ -n "${LABEL_SEGY}" ]]; then
   cmd+=(--label_segy "${LABEL_SEGY}")
+fi
+
+if [[ "${FULL_COVERAGE}" == "true" ]]; then
+  cmd+=(--full_coverage)
 fi
 
 if [ "${NPROC_PER_NODE}" -gt 1 ]; then

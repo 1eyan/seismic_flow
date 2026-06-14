@@ -90,8 +90,11 @@ class DatasetH5_ovtbin:
         ovt_target_slots: int = 32,
         kdtree_offset_weight: float = 2.0,
         profile=None,
+        seed: int = 0,
+        full_coverage: bool = False,
     ):
         self.train = train
+        self.rng = np.random.RandomState(seed)
         self.time_ps = int(time_ps)
         self.trace_ps = int(trace_ps)
         self.target_slots = int(ovt_target_slots)
@@ -198,6 +201,8 @@ class DatasetH5_ovtbin:
         except ImportError:
             print("  scipy not available; using numpy top-k fallback")
 
+        self.full_coverage = full_coverage and not train
+
         # ------------------------------------------------------------------
         # 6. Target pool
         # ------------------------------------------------------------------
@@ -205,12 +210,52 @@ class DatasetH5_ovtbin:
             self._target_pool = self._grid_observed.copy()
         else:
             self._target_pool = self._grid_missing.copy()
-        # Each __getitem__ randomly samples target_slots from the pool.
-        # Epoch length = pool_size / target_slots → each target seen ~1× per epoch.
-        self._epoch_len = max(1, len(self._target_pool) // self.target_slots)
+
+        # ------------------------------------------------------------------
+        # 7. Full-coverage plan (deterministic, all grid cells, no random sampling)
+        # ------------------------------------------------------------------
+        self._coverage_plan = []  # list of (ovt_id, target_grid_indices)
+        if self.full_coverage:
+            # Merge observed + missing per OVT — covers EVERY grid cell exactly once
+            self._grid_all_by_ovt = {}
+            all_ovt_ids = set(self.grid_observed_by_ovt.keys()) | set(self.grid_missing_by_ovt.keys())
+            n_all_cells = 0
+            for ovt_id in sorted(all_ovt_ids):
+                obs = self.grid_observed_by_ovt.get(ovt_id, np.array([], dtype=np.int64))
+                mis = self.grid_missing_by_ovt.get(ovt_id, np.array([], dtype=np.int64))
+                merged = np.concatenate([obs, mis])
+                self._grid_all_by_ovt[ovt_id] = merged
+                n_all_cells += len(merged)
+
+            # Build coverage plan: chunk each OVT's cells into batches of target_slots.
+            # Last chunk per OVT may be smaller — no cross-OVT padding (方案A).
+            for ovt_id in sorted(self._grid_all_by_ovt.keys()):
+                pool = self._grid_all_by_ovt[ovt_id]
+                for start in range(0, len(pool), self.target_slots):
+                    chunk = pool[start:start + self.target_slots]
+                    self._coverage_plan.append((int(ovt_id), chunk.copy()))
+
+            self._epoch_len = len(self._coverage_plan)
+            n_label = self.h5_regular["data"].shape[0]
+            print(f"  [FULL_COVERAGE] grid cells: total={n_all_cells} "
+                  f"observed={len(self._grid_observed)} missing={len(self._grid_missing)}")
+            print(f"  [FULL_COVERAGE] coverage plan: batches={self._epoch_len} "
+                  f"targets={n_all_cells}")
+            print(f"  [FULL_COVERAGE] label H5 traces: {n_label}")
+            if n_all_cells != n_label:
+                raise ValueError(
+                    f"[FULL_COVERAGE] grid cell count ({n_all_cells}) != "
+                    f"label H5 trace count ({n_label}). Grid and label H5 mismatch!"
+                )
+            print(f"  [FULL_COVERAGE] grid cell count matches label H5 trace count: OK")
+        else:
+            # Each __getitem__ randomly samples target_slots from the pool.
+            # Epoch length = pool_size / target_slots → each target seen ~1× per epoch.
+            self._epoch_len = max(1, len(self._target_pool) // self.target_slots)
 
         print(f"  target pool: {len(self._target_pool)}, "
-              f"epoch_len: {self._epoch_len} (random sampling)")
+              f"epoch_len: {self._epoch_len} "
+              f"({'full_coverage' if self.full_coverage else 'random sampling'})")
 
     # ==================================================================
     # Internal helpers
@@ -614,6 +659,8 @@ class DatasetH5_ovtbin:
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if self.train:
             return self._get_train_item(idx)
+        elif self.full_coverage:
+            return self._get_test_item_full(idx)
         else:
             return self._get_test_item(idx)
 
@@ -623,16 +670,16 @@ class DatasetH5_ovtbin:
 
     def _get_train_item(self, idx: int) -> Dict[str, Any]:
         # 1. Select OVT by sqrt(count) weight, then pick targets from that OVT
-        ovt_id = int(np.random.choice(self.ovt_ids, p=self.ovt_weights))
+        ovt_id = int(self.rng.choice(self.ovt_ids, p=self.ovt_weights))
         ovt_pool = self.grid_observed_by_ovt[ovt_id]
         if len(ovt_pool) >= self.target_slots:
-            target_grid_indices = np.random.choice(
+            target_grid_indices = self.rng.choice(
                 ovt_pool, size=self.target_slots, replace=False
             )
         else:
             # Edge case: OVT has fewer than target_slots — take all, fill from pool
             n_fill = self.target_slots - len(ovt_pool)
-            fill = np.random.choice(
+            fill = self.rng.choice(
                 self._target_pool, size=n_fill, replace=False
             )
             target_grid_indices = np.concatenate([ovt_pool, fill])
@@ -667,15 +714,15 @@ class DatasetH5_ovtbin:
 
     def _get_test_item(self, idx: int) -> Dict[str, Any]:
         # 1. Select OVT by sqrt(count) weight, then pick targets from that OVT
-        ovt_id = int(np.random.choice(self.ovt_ids, p=self.ovt_weights))
+        ovt_id = int(self.rng.choice(self.ovt_ids, p=self.ovt_weights))
         ovt_pool = self.grid_missing_by_ovt[ovt_id]
         if len(ovt_pool) >= self.target_slots:
-            target_grid_indices = np.random.choice(
+            target_grid_indices = self.rng.choice(
                 ovt_pool, size=self.target_slots, replace=False
             )
         else:
             n_fill = self.target_slots - len(ovt_pool)
-            fill = np.random.choice(
+            fill = self.rng.choice(
                 self._target_pool, size=n_fill, replace=False
             )
             target_grid_indices = np.concatenate([ovt_pool, fill])
@@ -694,6 +741,32 @@ class DatasetH5_ovtbin:
         context_data = _crop_or_pad_time(context_data, self.time_ps)
 
         # 5. Build patch
+        return self._build_patch(
+            target_grid_indices, context_raw_indices, target_data, context_data,
+            ovt_id=ovt_id,
+        )
+
+    def _get_test_item_full(self, idx: int) -> Dict[str, Any]:
+        """Deterministic full-coverage inference: each grid cell exactly once.
+
+        Reads from pre-computed _coverage_plan.  No random sampling.  The last
+        chunk per OVT may have fewer than target_slots cells — valid_trace_mask
+        handles variable batch sizes natively (方案A: 不跨OVT填充).
+        """
+        ovt_id, target_grid_indices = self._coverage_plan[idx]
+
+        # No forbidden keys for inference
+        context_raw_indices = self._query_context(
+            target_grid_indices, set(), ovt_id
+        )
+
+        # target_data from regular H5 (label), context from raw H5
+        target_data = self.h5_regular["data"][target_grid_indices].astype(np.float32)
+        target_data = _crop_or_pad_time(target_data, self.time_ps)
+
+        context_data = self.h5_raw["data"][context_raw_indices].astype(np.float32)
+        context_data = _crop_or_pad_time(context_data, self.time_ps)
+
         return self._build_patch(
             target_grid_indices, context_raw_indices, target_data, context_data,
             ovt_id=ovt_id,

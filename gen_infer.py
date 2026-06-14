@@ -517,7 +517,7 @@ def flow_sample(
     return pred.squeeze(1).detach().cpu().numpy().astype(np.float32)
 
 
-def build_dataset(args, logger, profile: SegyProfile):
+def build_dataset(args, logger, profile: SegyProfile, seed: int = 0):
     dataset_mode = getattr(args, 'dataset_mode', 'interp')
     if dataset_mode == 'ovtbin':
         from dataset.datasets_ovtbin import DatasetH5_ovtbin
@@ -540,10 +540,13 @@ def build_dataset(args, logger, profile: SegyProfile):
             ovt_target_slots=getattr(args, 'ovt_target_slots', 32),
             kdtree_offset_weight=getattr(args, 'ovt_kdtree_offset_weight', 2.0),
             profile=profile,
+            seed=seed,
+            full_coverage=getattr(args, 'full_coverage', False),
         )
         logger.info(
-            "[OVTBIN] dataset ready: patches=%d time_ps=%d trace_ps=%d",
+            "[OVTBIN] dataset ready: patches=%d time_ps=%d trace_ps=%d full_coverage=%s",
             len(dataset), dataset.time_ps, dataset.trace_ps,
+            getattr(dataset, 'full_coverage', False),
         )
         return dataset
     else:
@@ -951,6 +954,9 @@ def parse_args() -> argparse.Namespace:
                         help="Target slots per patch for OVT SSL")
     parser.add_argument("--ovt_kdtree_offset_weight", type=float, default=2.0,
                         help="Offset weight in 4D KNN for OVT SSL")
+    parser.add_argument("--full_coverage", action="store_true",
+                        help="Full-coverage inference: deterministically infer every grid cell "
+                             "(observed+missing) exactly once (OVT SSL only)")
     parser.add_argument("--non_strict_load", dest="strict_load", action="store_false")
     parser.add_argument("--strict_fill", dest="strict_fill", action="store_true")
     parser.add_argument("--no_progress", dest="progress", action="store_false")
@@ -1035,10 +1041,11 @@ def main() -> None:
     missing_global = np.all(np.abs(mask_data) <= args.missing_eps, axis=1)
     if rank == 0:
         logger.info(
-            "template SEGY: traces=%d samples=%d missing=%d",
+            "template SEGY: traces=%d samples=%d missing=%d full_coverage=%s",
             mask_data.shape[0],
             mask_data.shape[1],
             int(missing_global.sum()),
+            getattr(args, 'full_coverage', False),
         )
 
     # Read SEG-Y trace headers for geometry-key-based matching
@@ -1056,7 +1063,8 @@ def main() -> None:
         if rank == 0:
             logger.info("label SEGY loaded: %s shape=%s", args.label_segy, label_data.shape)
 
-    dataset = build_dataset(args, logger if rank == 0 else logging.getLogger("gen_infer"), profile)
+    dataset = build_dataset(args, logger if rank == 0 else logging.getLogger("gen_infer"),
+                           profile, seed=rank)
     if rank == 0:
         logger.info("use_p_scale=%s p_scale=%s", args.use_p_scale, getattr(dataset, 'p_scale', None))
         logger.info("inference_batch_size=%d world_size=%d", args.inference_batch_size, world_size)
@@ -1097,9 +1105,11 @@ def main() -> None:
         # Inference-only DDP: each rank processes its own data subset independently.
         # No gradient sync needed — the model runs raw.  Only dist.all_gather_object
         # below is used to merge predictions across ranks.
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        shuffle = not args.full_coverage
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
         if rank == 0:
-            logger.info("DDP: world_size=%d rank=%d local_rank=%d", world_size, rank, local_rank)
+            logger.info("DDP: world_size=%d rank=%d local_rank=%d shuffle=%s",
+                        world_size, rank, local_rank, shuffle)
     else:
         sampler = None
 
@@ -1135,8 +1145,14 @@ def main() -> None:
         with open(_rank_dir / "infer_stats.json", "w") as _f:
             json.dump(infer_stats, _f)
 
-        # File-based barrier: signal completion
-        (_RANK_TMP / f".rank_{rank}_done").touch()
+        # File-based barrier: signal completion (fsync to flush before signalling)
+        _done = _RANK_TMP / f".rank_{rank}_done"
+        _done.touch()
+        try:
+            with open(str(_done), "r+") as _f:
+                os.fsync(_f.fileno())
+        except OSError:
+            pass
 
         if rank == 0:
             _max_wait = 86400  # 24h
