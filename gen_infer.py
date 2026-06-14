@@ -1105,8 +1105,24 @@ def main() -> None:
         # Inference-only DDP: each rank processes its own data subset independently.
         # No gradient sync needed — the model runs raw.  Only dist.all_gather_object
         # below is used to merge predictions across ranks.
-        shuffle = not args.full_coverage
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+        if args.full_coverage:
+            # Non-wrapping shard: every batch processed by exactly one rank.
+            # DistributedSampler's drop_last=False would wrap-around and duplicate
+            # ceil(N/W)*W - N batches at the beginning — breaking the "exactly once"
+            # guarantee.  Use simple rank-strided indexing instead.
+            total = len(dataset)
+            indices = list(range(rank, total, world_size))
+
+            class _ShardSampler(torch.utils.data.Sampler):
+                def __init__(self, idx): self.idx = list(idx)
+                def __iter__(self): return iter(self.idx)
+                def __len__(self): return len(self.idx)
+
+            sampler = _ShardSampler(indices)
+            shuffle = False
+        else:
+            sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            shuffle = True
         if rank == 0:
             logger.info("DDP: world_size=%d rank=%d local_rank=%d shuffle=%s",
                         world_size, rank, local_rank, shuffle)
