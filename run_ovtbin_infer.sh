@@ -71,7 +71,7 @@ SDE_SAMPLING_METHOD="${SDE_SAMPLING_METHOD:-Euler}"
 SDE_NUM_STEPS="${SDE_NUM_STEPS:-250}"
 
 # ---- Additional ----
-FULL_COVERAGE="${FULL_COVERAGE:-true}"  # 全量推理：遍历全部网格单元（observed+missing）恰好一次
+FULL_COVERAGE="${FULL_COVERAGE:-true}"    # 全量推理：遍历全部网格单元（observed+missing）恰好一次
 VISUALIZE="${VISUALIZE:-true}"
 VIS_BATCHES="${VIS_BATCHES:-0}"
 BACKFILL_INTERVAL="${BACKFILL_INTERVAL:-1}"

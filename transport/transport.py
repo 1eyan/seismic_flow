@@ -119,20 +119,23 @@ class Transport:
     
 
     def training_losses(
-        self, 
-        model,  
-        x1, 
-        model_kwargs=None
+        self,
+        model,
+        x1,
+        model_kwargs=None,
+        loss_mask=None,
     ):
         """Loss for training the score model
         Args:
         - model: backbone model; could be score, noise, or velocity
         - x1: datapoint
         - model_kwargs: additional arguments for the model
+        - loss_mask: [B, H] or None. 1=compute loss, 0=ignore.
+          Applied per-trace before spatial reduction. None = uniform (backward compat).
         """
         if model_kwargs == None:
             model_kwargs = {}
-        
+
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         model_output = model(xt, t, **model_kwargs)
@@ -144,13 +147,29 @@ class Transport:
         terms['ut'] = ut
         terms['t'] = t
         terms['xt'] = xt
+
+        # Helper: apply per-trace loss_mask before spatial reduction
+        def _reduce_loss(per_element_loss, mask):
+            if mask is not None:
+                # mask: [B, H] -> [B, 1, H, 1] broadcasts with [B, 1, H, W]
+                # Each query trace contributes W time-step positions.
+                m = mask.unsqueeze(1).unsqueeze(-1)
+                per_element_loss = per_element_loss * m
+                # n_active counts traces; multiply by time_len for total elements
+                n_active = m.reshape(m.shape[0], -1).sum(dim=1) * per_element_loss.shape[-1]
+                return per_element_loss.reshape(
+                    per_element_loss.shape[0], -1
+                ).sum(dim=1) / n_active.clamp(min=1)
+            else:
+                return mean_flat(per_element_loss)
+
         if self.model_type == ModelType.VELOCITY:
+            per_element_loss = (model_output - ut) ** 2  # [B, 1, H, W]
             if self.loss_type == WeightType.LOGITNORMAL:
                 weight = path.expand_t_like_x(t, xt) * (1.0 - path.expand_t_like_x(t, xt)) + 1e-4
-                terms['loss'] = mean_flat(weight.detach() * ((model_output - ut) ** 2))
-            else:
-                terms['loss'] = mean_flat(((model_output - ut) ** 2))
-        else: 
+                per_element_loss = weight.detach() * per_element_loss
+            terms['loss'] = _reduce_loss(per_element_loss, loss_mask)
+        else:
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
             if self.loss_type in [WeightType.VELOCITY]:
@@ -161,12 +180,13 @@ class Transport:
                 weight = 1
             else:
                 raise NotImplementedError()
-            
+
             if self.model_type == ModelType.NOISE:
-                terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2))
+                per_element_loss = weight * ((model_output - x0) ** 2)
             else:
-                terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
-                
+                per_element_loss = weight * ((model_output * sigma_t + x0) ** 2)
+            terms['loss'] = _reduce_loss(per_element_loss, loss_mask)
+
         return terms
     
 

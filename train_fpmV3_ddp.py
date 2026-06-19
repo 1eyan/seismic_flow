@@ -96,6 +96,70 @@ def _batch_to_xy(batch):
     return None
 
 
+def _batch_to_xy_with_mask(batch):
+    """
+    返回 (data, data_mask, rx, ry, sx, sy, loss_mask, trace_mask, valid_mask)
+    当 batch 中不含 mask 时，mask 位置返回 None。
+    兼容所有数据集模式（queryctx / interp / ovtbin / SegySSL）。
+    """
+    if not isinstance(batch, dict):
+        return None
+    if "x_gt" in batch:
+        # SegySSL 格式 — 无 queryctx mask
+        return (
+            batch["x_gt"], batch["x_obs"],
+            batch["gx"], batch["gy"], batch["sx"], batch["sy"],
+            None, None, None,
+        )
+    if "data" in batch:
+        return (
+            batch["data"], batch["masked_patch"],
+            batch["rx_patch"], batch["ry_patch"], batch["sx_patch"], batch["sy_patch"],
+            batch.get("loss_mask"), batch.get("trace_mask"), batch.get("valid_mask"),
+        )
+    return None
+
+
+def collate_queryctx(samples):
+    """
+    按 batch 内最大 trace 数动态 padding，同时生成三个 trace-level mask：
+      - trace_mask: 1=观测 context 道，0=query/padding
+      - loss_mask:  1=query 道（需要算 loss），0=context/padding
+      - valid_mask: 1=真实道，0=padding
+
+    只在 dataset_mode='queryctx' / 'queryctx_v2' 时作为 DataLoader 的 collate_fn 使用。
+    """
+    import torch
+
+    max_tr = max(s["data"].shape[0] for s in samples)
+    time_len = samples[0]["data"].shape[1]
+    B = len(samples)
+
+    out = {
+        "data":         torch.zeros(B, max_tr, time_len),
+        "masked_patch": torch.zeros(B, max_tr, time_len),
+        "rx_patch":     torch.zeros(B, max_tr),
+        "ry_patch":     torch.zeros(B, max_tr),
+        "sx_patch":     torch.zeros(B, max_tr),
+        "sy_patch":     torch.zeros(B, max_tr),
+        "trace_mask":   torch.zeros(B, max_tr),   # 1=context(观测), 0=query/padding
+        "loss_mask":    torch.zeros(B, max_tr),   # 1=query(算loss), 0=context/padding
+        "valid_mask":   torch.zeros(B, max_tr),   # 1=真实道, 0=padding
+    }
+
+    for b, sample in enumerate(samples):
+        n_tr = sample["data"].shape[0]
+        for key in ("data", "masked_patch", "rx_patch", "ry_patch", "sx_patch", "sy_patch"):
+            out[key][b, :n_tr] = torch.as_tensor(sample[key])
+
+        is_q = torch.as_tensor(sample["is_query"])  # bool array
+        out["valid_mask"][b, :n_tr] = 1.0
+        out["trace_mask"][b, :n_tr] = (~is_q).float()   # context=1
+        out["loss_mask"][b, :n_tr]  = 1.0                # 所有真实道都算 loss
+
+    return out
+
+
 def save_hyperparameters(res_dir, kwargs, accelerator=None):
     """
     将超参数保存到JSON文件中
@@ -539,11 +603,12 @@ class trainer:
                     break
 
                 # 适配多种数据格式（SegySSL 字典 / DatasetH5_all 字典 / 元组）
-                xy = _batch_to_xy(batch) if isinstance(batch, dict) else None
+                xy = _batch_to_xy_with_mask(batch) if isinstance(batch, dict) else None
                 if xy is not None:
-                    data, data_mask, rx, ry, sx, sy = xy
+                    data, data_mask, rx, ry, sx, sy, loss_mask, trace_mask, valid_mask = xy
                 else:
                     data, data_mask, rx, ry, sx, sy, _, _ = batch
+                    loss_mask = None
 
                 data = data.unsqueeze(1).to(self.device)
                 data_mask = data_mask.unsqueeze(1).to(self.device)
@@ -555,9 +620,13 @@ class trainer:
                 )
                 condL = (rx, ry, sx, sy)
 
+                if loss_mask is not None:
+                    loss_mask = loss_mask.to(self.device)
+
                 with self.accelerator.autocast():
                     loss = self.flow_matching_model(
-                        data, condL=condL, x_cond=data_mask, time=None
+                        data, condL=condL, x_cond=data_mask, time=None,
+                        loss_mask=loss_mask,
                     )
                 val_losses.append(loss.item())
 
@@ -608,11 +677,12 @@ class trainer:
 
                 for idx, batch in enumerate(self.dl):
                     # 适配多种数据格式（SegySSL / DatasetH5_all 字典 或 元组）
-                    xy = _batch_to_xy(batch) if isinstance(batch, dict) else None
+                    xy = _batch_to_xy_with_mask(batch) if isinstance(batch, dict) else None
                     if xy is not None:
-                        data, data_mask, rx, ry, sx, sy = xy
+                        data, data_mask, rx, ry, sx, sy, loss_mask, trace_mask, valid_mask = xy
                     else:
                         data, data_mask, rx, ry, sx, sy, time_val, coord = batch
+                        loss_mask = None
 
                     data = data.unsqueeze(1).to(self.device)
                     data_mask = data_mask.unsqueeze(1).to(self.device)
@@ -624,10 +694,14 @@ class trainer:
                     )
                     condL = (rx, ry, sx, sy)
 
+                    if loss_mask is not None:
+                        loss_mask = loss_mask.to(self.device)
+
                     with self.accelerator.autocast():
                         # Flow Matching 的 forward 方法返回 loss
                         loss = self.flow_matching_model(
-                            data, condL=condL, x_cond=data_mask, time=None
+                            data, condL=condL, x_cond=data_mask, time=None,
+                            loss_mask=loss_mask,
                         )
                     loss = loss / accumulation_steps
                     self.accelerator.backward(loss)
@@ -802,6 +876,70 @@ def main():
             profile=profile,
         )
         print('[OVTBIN] Using DatasetH5_ovtbin for training')
+    elif dataset_mode == 'queryctx':
+        from dataset.dataset_reg import DatasetH5_all_queryctx
+        ds_neighbors = getattr(dataset_args, 'dataset_neighbors_train', None)
+        if ds_neighbors is None:
+            raise ValueError("--dataset_neighbors_train is required for dataset_mode=queryctx")
+        metric_weights_str = getattr(dataset_args, 'patch_metric_weights', '1.0,1.0,0.5,0.5')
+        metric_weights = tuple(float(x.strip()) for x in metric_weights_str.split(','))
+        sort_keys_str = getattr(dataset_args, 'trace_sort_keys_queryctx', 'rx,ry,sx,sy')
+        sort_keys = tuple(x.strip() for x in sort_keys_str.split(','))
+        dataset = DatasetH5_all_queryctx(
+            h5File=dataset_args.h5File,
+            h5File_regular=dataset_args.h5File_regular,
+            dataset_neighbors=ds_neighbors,
+            train=True,
+            train_num_query=getattr(dataset_args, 'train_num_query', 16),
+            train_context_size=getattr(dataset_args, 'train_context_size', None),
+            patch_beta=getattr(dataset_args, 'patch_beta', 0.3),
+            patch_metric_weights=metric_weights,
+            force_anchor_query=getattr(dataset_args, 'force_anchor_query', False),
+            trace_sort_keys=sort_keys,
+            key_columns=profile.key_columns,
+            use_p_scale=args.use_p_scale,
+            time_ps=getattr(dataset_args, 'time_ps', 1256),
+            trace_ps=getattr(dataset_args, 'trace_ps', 128),
+            epoch_repeat=getattr(dataset_args, 'epoch_repeat', 1),
+            coord_aug_scale=getattr(dataset_args, 'coord_aug_scale', 0.0),
+            allow_coord_stats_fallback=getattr(dataset_args, 'allow_coord_stats_fallback', False),
+            target_mode=getattr(dataset_args, 'target_mode', 'self'),
+            regular_holdout_npz=getattr(dataset_args, 'regular_holdout_npz', None),
+            regular_task_prob=getattr(dataset_args, 'regular_task_prob', 0.3),
+        )
+        print('[QUERYCTX] Using DatasetH5_all_queryctx for training')
+    elif dataset_mode == 'queryctx_v2':
+        from dataset.dataset_reg import DatasetH5_all_queryctxV2 as DatasetH5_all_queryctx
+        ds_neighbors = getattr(dataset_args, 'dataset_neighbors_train', None)
+        if ds_neighbors is None:
+            raise ValueError("--dataset_neighbors_train is required for dataset_mode=queryctx_v2")
+        metric_weights_str = getattr(dataset_args, 'patch_metric_weights', '1.0,1.0,0.5,0.5')
+        metric_weights = tuple(float(x.strip()) for x in metric_weights_str.split(','))
+        sort_keys_str = getattr(dataset_args, 'trace_sort_keys_queryctx', 'rx,ry,sx,sy')
+        sort_keys = tuple(x.strip() for x in sort_keys_str.split(','))
+        dataset = DatasetH5_all_queryctx(
+            h5File=dataset_args.h5File,
+            h5File_regular=dataset_args.h5File_regular,
+            dataset_neighbors=ds_neighbors,
+            train=True,
+            train_num_query=getattr(dataset_args, 'train_num_query', 16),
+            train_context_size=getattr(dataset_args, 'train_context_size', None),
+            patch_beta=getattr(dataset_args, 'patch_beta', 0.3),
+            patch_metric_weights=metric_weights,
+            force_anchor_query=getattr(dataset_args, 'force_anchor_query', False),
+            trace_sort_keys=sort_keys,
+            key_columns=profile.key_columns,
+            use_p_scale=args.use_p_scale,
+            time_ps=getattr(dataset_args, 'time_ps', 1256),
+            trace_ps=getattr(dataset_args, 'trace_ps', 128),
+            epoch_repeat=getattr(dataset_args, 'epoch_repeat', 1),
+            coord_aug_scale=getattr(dataset_args, 'coord_aug_scale', 0.0),
+            allow_coord_stats_fallback=getattr(dataset_args, 'allow_coord_stats_fallback', False),
+            target_mode=getattr(dataset_args, 'target_mode', 'self'),
+            regular_holdout_npz=getattr(dataset_args, 'regular_holdout_npz', None),
+            regular_task_prob=getattr(dataset_args, 'regular_task_prob', 0.3),
+        )
+        print('[QUERYCTX_V2] Using DatasetH5_all_queryctxV2 for training')
     else:
         dataset = datasets_interp.DatasetH5_interp(
             h5File_irregular=dataset_args.h5File,
@@ -824,6 +962,9 @@ def main():
         DistributedSampler(dataset, shuffle=False) if world_size > 1 else None
     )
 
+    # 条件化选择 collate_fn：只对 queryctx 模式启用可变 trace 数 padding + mask 生成
+    _collate_fn = collate_queryctx if dataset_mode in ('queryctx', 'queryctx_v2') else None
+
     dl_SIM = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -831,10 +972,12 @@ def main():
         num_workers=5,
         sampler=train_sampler,
         drop_last=True,
+        collate_fn=_collate_fn,
     )
     dl_SIM_VAL = DataLoader(
         dataset, batch_size=1, shuffle=False, num_workers=4, sampler=val_sampler,
         drop_last=True,
+        collate_fn=_collate_fn,
     )
     if rank ==0:
         print("dataset length:", len(dataset))
@@ -937,7 +1080,7 @@ def main():
         print(f"Pretrained weights loaded successfully from: {args.pretrained}")
     # ----------------------------------------------------------------
 
-    res_dir = f"./resultsFPM/{args.model_name}_datatype_{args.data_type}_0613_ovt"
+    res_dir = f"./resultsFPM/{args.model_name}_datatype_{args.data_type}_0616_5dsup"
 
     # 将模型移动到正确的设备
     model_unet = model_unet.to(device)

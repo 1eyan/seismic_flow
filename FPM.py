@@ -194,16 +194,19 @@ class FlowMatchingModel(nn.Module):
         condL: tuple = None,
         x_cond: torch.Tensor = None,
         time: torch.Tensor = None,
+        loss_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Forward pass for training. Computes the flow matching loss.
-        
+
         Args:
             x: Ground truth data [B, C, H, W]
             condL: Conditional information tuple (rx, ry, sx, sy)
             x_cond: Conditional input [B, C, H, W] (e.g., masked data)
             time: Time tensor [B] (optional, kept for compatibility, not used in flow matching)
-            
+            loss_mask: Per-trace loss mask [B, H] or None. 1=compute loss, 0=ignore.
+                       When None, loss is computed over all positions (backward compatible).
+
         Returns:
             loss: Training loss scalar tensor
         """
@@ -243,8 +246,8 @@ class FlowMatchingModel(nn.Module):
         # Prepare model kwargs (these are passed to wrapped_model via **kwargs)
         model_kwargs = {}
         
-        # Compute loss using transport
-        loss_dict = self.transport.training_losses(wrapped_model, x, model_kwargs)
+        # Compute loss using transport (loss_mask passed separately, not via model_kwargs)
+        loss_dict = self.transport.training_losses(wrapped_model, x, model_kwargs, loss_mask=loss_mask)
         loss = loss_dict['loss'].mean()
 
         if self.loss_weight_type == 'logitnormal':
