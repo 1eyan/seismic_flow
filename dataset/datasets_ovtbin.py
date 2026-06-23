@@ -286,23 +286,29 @@ class DatasetH5_ovtbin:
     def _compute_coord_stats(self) -> Dict[str, float]:
         """Compute min/max from regular H5 for midpoint and offset.
 
-        midpoint_x/y → rx/ry slots.  offset_x/y (raw!) → sx/sy slots.
-        Uses the regular H5's offset_x / offset_y (not offset_x_center) so that
-        raw traces' real offsets share the same normalisation range.
+        midpoint_x/y → rx/ry slots.  offset_x_center/y_center → sx/sy slots.
+        Uses offset_x_center (not raw offset_x) so that grid-cell target
+        coordinates and raw context coordinates share the same normalisation
+        range — critical for consistent coordinate encoding in the model.
         """
         rh5 = self.h5_regular
         # midpoint from regular H5
         mx = rh5["midpoint_x"].ravel()
         my = rh5["midpoint_y"].ravel()
-        # offset — use real offset_x / offset_y if present, else fallback to offset_x_center
-        if "offset_x" in rh5:
-            ox = rh5["offset_x"].ravel()  # not offset_x_center! raw offset
-        else:
+        # offset — use offset_x_center / offset_y_center (same type as grid cells),
+        # fallback to real offset_x / offset_y if center fields are missing
+        if "offset_x_center" in rh5:
             ox = rh5["offset_x_center"].ravel()
-        if "offset_y" in rh5:
+        elif "offset_x" in rh5:
+            ox = rh5["offset_x"].ravel()
+        else:
+            raise KeyError("regular H5 missing both offset_x_center and offset_x")
+        if "offset_y_center" in rh5:
+            oy = rh5["offset_y_center"].ravel()
+        elif "offset_y" in rh5:
             oy = rh5["offset_y"].ravel()
         else:
-            oy = rh5["offset_y_center"].ravel()
+            raise KeyError("regular H5 missing both offset_y_center and offset_y")
 
         # Percentile clip (same as DatasetH5_interp)
         mx_c = np.clip(mx, np.percentile(mx, 0.01), np.percentile(mx, 99.99))
@@ -310,9 +316,11 @@ class DatasetH5_ovtbin:
         ox_c = np.clip(ox, np.percentile(ox, 0.01), np.percentile(ox, 99.99))
         oy_c = np.clip(oy, np.percentile(oy, 0.01), np.percentile(oy, 99.99))
 
-        # Add a small margin (expand by 0.1%) so raw traces slightly outside
-        # the regular range don't all land at exactly 0 or 1.
-        margin = 0.001
+        # Expand by 1% on each side so that grid cells whose offset_center
+        # lies near the boundary still fall comfortably inside [0, 1] after
+        # clip-based normalisation.  1% is chosen to exceed bin_size/(2*span)
+        # from the offset_center discretisation step.
+        margin = 0.01
         def _expand(lo, hi):
             span = hi - lo
             return lo - span * margin, hi + span * margin
@@ -332,13 +340,15 @@ class DatasetH5_ovtbin:
     def _normalize_raw_coords(self) -> Dict[str, np.ndarray]:
         """Normalize all raw traces to [0,1] with clip.
 
-        Uses real offset_x / offset_y (not offset_x_center) for raw traces.
+        Uses offset_x_center / offset_y_center so raw context traces and
+        grid target cells share the same coordinate type, giving the model
+        consistent spatial encoding across the full patch.
         """
         s = self.coord_stats
         mx = self.h5_raw["midpoint_x"].ravel().astype(np.float64)
         my = self.h5_raw["midpoint_y"].ravel().astype(np.float64)
-        ox = self.h5_raw["offset_x"].ravel().astype(np.float64)
-        oy = self.h5_raw["offset_y"].ravel().astype(np.float64)
+        ox = self.h5_raw["offset_x_center"].ravel().astype(np.float64)
+        oy = self.h5_raw["offset_y_center"].ravel().astype(np.float64)
 
         mx_n = np.clip((mx - s["rx_min"]) / (s["rx_max"] - s["rx_min"] + 1e-12), 0.0, 1.0)
         my_n = np.clip((my - s["ry_min"]) / (s["ry_max"] - s["ry_min"] + 1e-12), 0.0, 1.0)
@@ -535,13 +545,15 @@ class DatasetH5_ovtbin:
         # Place target and context data in unsorted arrays
         all_data = np.concatenate([target_data, context_data], axis=0)
 
-        # Target coords (grid centers)
+        # Target coords (grid centers — normalized via _normalize_grid_coords)
         t_mx_n, t_my_n, t_ox_n, t_oy_n = self._normalize_grid_coords(target_indices)
-        # Context coords (raw positions)
+        # Context coords — use offset_x_center / offset_y_center so that
+        # target and context slots share the same coordinate type, giving the
+        # model consistent spatial encoding across the full patch.
         c_mx = self.h5_raw["midpoint_x"].ravel()[context_indices].astype(np.float64)
         c_my = self.h5_raw["midpoint_y"].ravel()[context_indices].astype(np.float64)
-        c_ox = self.h5_raw["offset_x"].ravel()[context_indices].astype(np.float64)
-        c_oy = self.h5_raw["offset_y"].ravel()[context_indices].astype(np.float64)
+        c_ox = self.h5_raw["offset_x_center"].ravel()[context_indices].astype(np.float64)
+        c_oy = self.h5_raw["offset_y_center"].ravel()[context_indices].astype(np.float64)
         c_mx_n, c_my_n, c_ox_n, c_oy_n = self._normalize_bare(c_mx, c_my, c_ox, c_oy)
 
         all_rx = np.concatenate([t_mx_n, c_mx_n])
